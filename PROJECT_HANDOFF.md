@@ -33,9 +33,9 @@
 ## Verification Status
 - Tests/builds run: 2026-06-22 text search after authorization-file removal; remaining matching terms are third-party dependency metadata in `package-lock.json`.
 - Documentation checks run: 2026-06-22 README update instructions reviewed with `sed`; whitespace checked with `git diff --check`.
-- Deployment checks: Not run.
+- Deployment checks: Supply-Chain IOC Scan workflow run `28849296042` completed successfully on 2026-07-07 after the private Action checkout fix.
 - Known passing flows: Not verified in this session.
-- Supply-chain scan workflow: fixed on 2026-07-07 to check out the private Action repo with `SUPPLY_CHAIN_INTEL_ACTION_TOKEN`, use a repository-local empty test feed by default, and allow `feed_url`/`SUPPLY_CHAIN_INTEL_FEED_URL` override.
+- Supply-chain scan workflow: fixed on 2026-07-07 to check out the private Action repo with `SUPPLY_CHAIN_INTEL_ACTION_TOKEN`, use a repository-local empty test feed by default, allow `feed_url`/`SUPPLY_CHAIN_INTEL_FEED_URL` override, and manually verified run `28849296042` succeeded.
 
 ## Known Risks and Constraints
 - Technical risks: macOS/Windows builds are unsigned, so first launch and downloaded macOS updates may be blocked by platform security prompts.
@@ -52,3 +52,4 @@
 - 2026-06-22: Added README troubleshooting steps for macOS users who overwrite-install an updated app and still see "damaged" with no Security & Privacy bypass record.
 - 2026-06-22: Removed project-level authorization file and README badge/section; verified no project-level authorization references remain outside third-party dependency metadata.
 - 2026-07-07: Updated scheduled Supply-Chain IOC Scan workflow to work with a private scanner Action repository by checking it out using `SUPPLY_CHAIN_INTEL_ACTION_TOKEN`; added `.github/supply-chain-ioc-feed.json` empty test feed for scheduled runs.
+- 2026-07-07: Stored `SUPPLY_CHAIN_INTEL_ACTION_TOKEN` as a repository secret and verified workflow dispatch run `28849296042` succeeded, including private Action checkout, scan execution, and SARIF upload.

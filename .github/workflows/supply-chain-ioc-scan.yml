@@ -8,21 +8,36 @@ on:
       feed_url:
         description: Optional immutable test-feed URL
         required: false
-        default: "https://raw.githubusercontent.com/BUG-gao/supply-chain-intel-platform/v0.1.0/tests/fixtures/empty-feed.json"
+        default: ""
 
 permissions:
   contents: read
   security-events: write
 
+env:
+  SUPPLY_CHAIN_INTEL_ACTION_REPOSITORY: BUG-gao/supply-chain-intel-platform
+  SUPPLY_CHAIN_INTEL_ACTION_REF: feature/intelligence-platform-mvp
+  SUPPLY_CHAIN_INTEL_ACTION_PATH: .github/actions/supply-chain-intel-platform
+
 jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - id: ioc-scan
-        uses: BUG-gao/supply-chain-intel-platform@v0.1.0
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Checkout private scanner action
+        uses: actions/checkout@v4
         with:
-          feed-url: ${{ inputs.feed_url }}
+          repository: ${{ env.SUPPLY_CHAIN_INTEL_ACTION_REPOSITORY }}
+          ref: ${{ env.SUPPLY_CHAIN_INTEL_ACTION_REF }}
+          token: ${{ secrets.SUPPLY_CHAIN_INTEL_ACTION_TOKEN }}
+          path: ${{ env.SUPPLY_CHAIN_INTEL_ACTION_PATH }}
+          persist-credentials: false
+      - id: ioc-scan
+        uses: ./.github/actions/supply-chain-intel-platform
+        with:
+          feed-url: ${{ github.event.inputs.feed_url || vars.SUPPLY_CHAIN_INTEL_FEED_URL || '' }}
+          feed-file: .github/supply-chain-ioc-feed.json
           fail-on-severity: high
           sarif-path: supply-chain-ioc.sarif
       - name: Upload SARIF

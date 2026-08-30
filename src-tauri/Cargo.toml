@@ -1,6 +1,6 @@
 [package]
 name = "floating-todo"
-version = "0.3.1"
+version = "0.5.0"
 description = "悬浮待办 · 跨平台桌面悬浮待办小组件"
 authors = ["gaopengfei"]
 edition = "2021"
@@ -23,3 +23,10 @@ serde_json = "1"
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-autostart = "2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

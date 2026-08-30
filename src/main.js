@@ -1,344 +1,759 @@
-/* 悬浮待办 · 跨平台前端逻辑 (Tauri v2 + 原生 JS) */
+/* 悬浮待办 · 时间线版 (Tauri v2 + 原生 JavaScript) */
+
+import {
+  addDays,
+  bucketFutureHorizonEntries,
+  buildFutureHorizonEntries,
+  dayDistance,
+  dueTimestamp,
+  fromDateKey,
+  goalProgressForDate,
+  goalWeekStats,
+  migrateSnapshot,
+  routineOccursOnDate,
+  routinesForDate,
+  toDateKey,
+} from "./domain.js";
+import {
+  isWindowPositionVisible,
+  normalizeWindowState,
+  WINDOW_LIMITS,
+} from "./window-state.js";
 
 const TAURI = window.__TAURI__;
 const appWindow = TAURI?.window?.getCurrentWindow?.();
-
-async function openExternal(url) {
-  try {
-    if (TAURI?.opener?.openUrl) await TAURI.opener.openUrl(url);
-    else await TAURI.core.invoke("plugin:opener|open_url", { url });
-  } catch (e) {
-    window.open(url, "_blank");
-  }
-}
-
-/* ---------------- 数据模型 ---------------- */
-
-const DAYS = ["today", "tomorrow", "dayAfterTomorrow"];
-const DAY_TITLE = { today: "今天", tomorrow: "明天", dayAfterTomorrow: "后天" };
 const STORAGE_KEY = "floating-todo/snapshot";
+const WINDOW_STATE_KEY = "floating-todo/window-state-v1";
+const WINDOW_STATE_SAVE_DELAY = 220;
+const COMPACT_ENTER_WIDTH = 300;
+const COMPACT_ENTER_HEIGHT = 260;
+const COMPACT_EXIT_WIDTH = 312;
+const COMPACT_EXIT_HEIGHT = 272;
+const OVERVIEW_WIDE_BREAKPOINT = 720;
+const OVERVIEW_LARGE_BREAKPOINT = 1100;
+const COMPLETED_RENDER_LIMIT = 30;
+const app = document.getElementById("app");
+document.documentElement.classList.toggle("browser-preview", !TAURI);
+
+if ("scrollRestoration" in history) history.scrollRestoration = "manual";
+window.scrollTo(0, 0);
 
 const uid = () =>
-  crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random());
+  crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
 
-function todayStr(d = new Date()) {
-  const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-  return `${x.getFullYear()}-${x.getMonth() + 1}-${x.getDate()}`;
-}
-
-function dayDelta(fromStr, toStr) {
-  const [fy, fm, fd] = fromStr.split("-").map(Number);
-  const [ty, tm, td] = toStr.split("-").map(Number);
-  const a = new Date(fy, fm - 1, fd);
-  const b = new Date(ty, tm - 1, td);
-  return Math.round((b - a) / 86400000);
-}
-
-function dateLabel(offset) {
-  const d = new Date();
-  d.setDate(d.getDate() + offset);
-  return `${d.getMonth() + 1}月${d.getDate()}日`;
-}
-
-const pad = (n) => String(n).padStart(2, "0");
-function yesterdayStr() {
-  const d = new Date();
-  d.setDate(d.getDate() - 1);
-  return todayStr(d);
-}
-function nowHHMM() {
-  const d = new Date();
-  return pad(d.getHours()) + ":" + pad(d.getMinutes());
-}
-
-/* 从输入里解析时间，如 15:00 / 下午3点半 / 晚上8点30 / 9点 */
-function parseTime(s) {
-  let m = s.match(/(\d{1,2}):(\d{2})/);
-  if (m) {
-    return { time: pad(Math.min(23, +m[1])) + ":" + pad(Math.min(59, +m[2])), match: m[0] };
-  }
-  m = s.match(/(上午|早上|凌晨|下午|晚上|中午)?\s*(\d{1,2})\s*点\s*(半|\d{1,2})?\s*分?/);
-  if (m && (m[1] || m[3] !== undefined || /点/.test(m[0]))) {
-    let h = +m[2];
-    let mm = 0;
-    if (m[3] === "半") mm = 30;
-    else if (m[3]) mm = Math.min(59, +m[3]);
-    const p = m[1];
-    if ((p === "下午" || p === "晚上") && h < 12) h += 12;
-    if (p === "中午" && h < 12) h = 12;
-    if ((p === "凌晨" || p === "早上" || p === "上午") && h === 12) h = 0;
-    return { time: pad(Math.min(23, h)) + ":" + pad(mm), match: m[0] };
-  }
-  return null;
-}
-
-/* 自然语言：识别「明天/后天/今天」分组和时间，返回 {day, time, title} */
-function parseQuickInput(text, defaultDay) {
-  let title = text.trim();
-  let day = defaultDay;
-  if (/^(今天|今日)/.test(title)) { day = "today"; title = title.replace(/^(今天|今日)\s*/, ""); }
-  else if (/^明天/.test(title)) { day = "tomorrow"; title = title.replace(/^明天\s*/, ""); }
-  else if (/^后天/.test(title)) { day = "dayAfterTomorrow"; title = title.replace(/^后天\s*/, ""); }
-
-  let time = null;
-  const t = parseTime(title);
-  if (t) { time = t.time; title = title.replace(t.match, " ").replace(/\s+/g, " ").trim(); }
-  return { day, time, title: title.trim() };
-}
-
-function defaultState() {
-  return {
-    selectedDay: "today",
-    itemsByDay: { today: [], tomorrow: [], dayAfterTomorrow: [] },
-    recurringItems: [],
-    settings: {
-      alwaysOnTop: true,
-      opacity: 0.78,
-      appearance: "system",
-      customBg: null,
-      memoEnabled: false,
-      clickThrough: false,
-    },
-    memo: { text: "", expanded: false },
-    lastActiveDate: todayStr(),
-  };
-}
-
-function load() {
-  let s;
+function readSnapshot() {
   try {
-    s = JSON.parse(localStorage.getItem(STORAGE_KEY));
-  } catch (e) {
-    s = null;
+    return migrateSnapshot(JSON.parse(localStorage.getItem(STORAGE_KEY)));
+  } catch (_) {
+    return migrateSnapshot(null);
   }
-  const base = defaultState();
-  if (!s) return base;
-  // 合并，兼容旧数据缺字段
-  const state = {
-    ...base,
-    ...s,
-    itemsByDay: { ...base.itemsByDay, ...(s.itemsByDay || {}) },
-    settings: { ...base.settings, ...(s.settings || {}) },
-    memo: { ...base.memo, ...(s.memo || {}) },
-    recurringItems: s.recurringItems || [],
-    lastActiveDate: s.lastActiveDate || todayStr(),
-  };
-  return state;
 }
 
-let state = load();
+function readWindowState() {
+  try {
+    return normalizeWindowState(JSON.parse(localStorage.getItem(WINDOW_STATE_KEY)));
+  } catch (_) {
+    return null;
+  }
+}
+
+let state = readSnapshot();
+let rememberedWindowState = readWindowState();
+let compact = rememberedWindowState?.compact === true;
+let lastRenderedDate = toDateKey();
+let statusAnnouncement = "";
+let windowStateSaveTimer = null;
+let reminderCheckRunning = false;
+let notificationPermissionRequested = false;
+let appliedAlwaysOnTop;
+let appliedClickThrough;
+let showAllCompleted = false;
+let activeMainView = "overview";
+let overviewWidthTier = getOverviewWidthTier();
+const viewScrollTop = { overview: 0, list: 0 };
+
+function getOverviewWidthTier(width = window.innerWidth) {
+  if (width >= OVERVIEW_LARGE_BREAKPOINT) return 2;
+  if (width >= OVERVIEW_WIDE_BREAKPOINT) return 1;
+  return 0;
+}
 
 function save() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-}
-
-/* ---------------- 跨天滚动 ---------------- */
-
-function rollOverIfNeeded() {
-  const today = todayStr();
-  const delta = dayDelta(state.lastActiveDate, today);
-  if (delta <= 0) return;
-
-  const offset = { today: 0, tomorrow: 1, dayAfterTomorrow: 2 };
-  const result = { today: [], tomorrow: [], dayAfterTomorrow: [] };
-  let overdue = [];
-
-  for (const day of DAYS) {
-    const items = state.itemsByDay[day] || [];
-    const newOffset = offset[day] - delta;
-    if (newOffset >= 0) {
-      const target = DAYS.find((d) => offset[d] === newOffset);
-      result[target].push(...items);
-    } else {
-      overdue.push(...items.filter((it) => !it.completed));
-    }
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    return true;
+  } catch (error) {
+    statusAnnouncement = "本地存储空间不足，新更改暂时无法保存";
+    console.error("Unable to persist the todo snapshot", error);
+    return false;
   }
-  // 过期未完成顺延到今天底部
-  result.today = [...result.today, ...overdue];
-  // 新的一天，今天的待办重置提醒标记
-  result.today = result.today.map((it) => ({ ...it, notified: false }));
-
-  // 常驻待办每天重置完成状态与提醒；中断超过一天则连胜清零
-  const y = yesterdayStr();
-  state.recurringItems = state.recurringItems.map((it) => {
-    const reset = { ...it, completed: false, notified: false };
-    if (it.lastDone !== y && it.lastDone !== today) reset.streak = 0;
-    return reset;
-  });
-
-  state.itemsByDay = result;
-  state.lastActiveDate = today;
-  save();
 }
 
-/* ---------------- 业务操作 ---------------- */
-
-const stableSort = (arr) => [
-  ...arr.filter((i) => !i.completed),
-  ...arr.filter((i) => i.completed),
-];
-
-function items(day = state.selectedDay) {
-  return state.itemsByDay[day] || [];
-}
-function incompleteCount(day = state.selectedDay) {
-  return items(day).filter((i) => !i.completed).length;
-}
-function completedCount(day = state.selectedDay) {
-  return items(day).filter((i) => i.completed).length;
+function cloneState() {
+  return JSON.parse(JSON.stringify(state));
 }
 
-function addItem(title, day = state.selectedDay, time = null) {
-  const t = title.trim();
-  if (!t) return null;
-  const it = { id: uid(), title: t, detail: "", time, completed: false, notified: false, createdAt: Date.now() };
-  state.itemsByDay[day].unshift(it);
-  save();
-  return it;
-}
-function toggleItem(id, day) {
-  const arr = state.itemsByDay[day];
-  const it = arr.find((i) => i.id === id);
-  if (!it) return;
-  it.completed = !it.completed;
-  state.itemsByDay[day] = stableSort(arr);
-  save();
-}
-function deleteItem(id, day) {
-  state.itemsByDay[day] = state.itemsByDay[day].filter((i) => i.id !== id);
-  save();
-}
-function updateItem(id, day, title, detail) {
-  const it = state.itemsByDay[day].find((i) => i.id === id);
-  if (!it) return;
-  if (title !== undefined && title.trim()) it.title = title.trim();
-  if (detail !== undefined) it.detail = detail.trim();
-  save();
-}
-function moveItem(id, from, to) {
-  const arr = state.itemsByDay[from];
-  const idx = arr.findIndex((i) => i.id === id);
-  if (idx < 0) return;
-  const [it] = arr.splice(idx, 1);
-  state.itemsByDay[to].unshift(it);
-  save();
-}
-function clearCompleted(day) {
-  state.itemsByDay[day] = state.itemsByDay[day].filter((i) => !i.completed);
-  save();
+function persistMutation(mutate) {
+  const rollback = mutate();
+  if (save()) return true;
+  rollback?.();
+  statusAnnouncement = "本地存储空间不足，新更改未保存";
+  return false;
 }
 
-/* 常驻「每天」待办 */
-function addRecurring(title, time = null) {
-  const t = title.trim();
-  if (!t) return;
-  state.recurringItems.unshift({
-    id: uid(),
-    title: t,
-    detail: "",
-    time,
-    completed: false,
-    notified: false,
-    streak: 0,
-    lastDone: null,
-    createdAt: Date.now(),
-  });
-  save();
-}
-function toggleRecurring(id) {
-  const it = state.recurringItems.find((i) => i.id === id);
-  if (!it) return;
-  const today = todayStr();
-  if (!it.completed) {
-    it.completed = true;
-    it.notified = true;
-    if (it.lastDone === today) {
-      // 今天已计入连胜
-    } else if (it.lastDone === yesterdayStr()) {
-      it.streak = (it.streak || 0) + 1;
-    } else {
-      it.streak = 1;
-    }
-    it.lastDone = today;
-  } else {
-    it.completed = false;
-    if (it.lastDone === today) {
-      it.streak = Math.max(0, (it.streak || 0) - 1);
-      it.lastDone = it.streak > 0 ? yesterdayStr() : null;
-    }
+function showPersistenceError(overlay, message = "本地存储空间不足，暂时无法保存。请先导出备份并清理较早记录。") {
+  if (!overlay) return;
+  statusAnnouncement = "";
+  let error = overlay.querySelector("[data-persistence-error]");
+  if (!error) {
+    error = document.createElement("p");
+    error.className = "dialog-save-error";
+    error.dataset.persistenceError = "";
+    error.setAttribute("role", "alert");
+    const actions = overlay.querySelector(".dialog-actions");
+    if (actions) actions.before(error);
+    else overlay.querySelector(".dialog")?.append(error);
   }
-  state.recurringItems = stableSort(state.recurringItems);
-  save();
-}
-function deleteRecurring(id) {
-  state.recurringItems = state.recurringItems.filter((i) => i.id !== id);
-  save();
-}
-function updateRecurringTitle(id, title) {
-  const it = state.recurringItems.find((i) => i.id === id);
-  if (it && title.trim()) it.title = title.trim();
-  save();
-}
-function pinAsRecurring(id, from) {
-  const arr = state.itemsByDay[from];
-  const idx = arr.findIndex((i) => i.id === id);
-  if (idx < 0) return;
-  const [it] = arr.splice(idx, 1);
-  it.completed = false;
-  state.recurringItems.unshift(it);
-  save();
-}
-function unpinRecurring(id) {
-  const idx = state.recurringItems.findIndex((i) => i.id === id);
-  if (idx < 0) return;
-  const [it] = state.recurringItems.splice(idx, 1);
-  state.itemsByDay.today.unshift(it);
-  save();
+  error.textContent = message;
 }
 
-/* ---------------- 工具 ---------------- */
+function clearPersistenceError(overlay) {
+  overlay?.querySelector("[data-persistence-error]")?.remove();
+}
 
-function esc(s) {
-  return String(s).replace(/[&<>"']/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+function pruneTransientState(dateKey = toDateKey()) {
+  const validIds = new Set([
+    ...state.items.map((item) => item.id),
+    ...(state.goals || []).map((goal) => goal.id),
+  ]);
+  state.expandedIds = [...new Set(state.expandedIds || [])].filter((id) => validIds.has(id));
+  if (state.settings.todayActionsCollapsedDate && state.settings.todayActionsCollapsedDate !== dateKey) {
+    state.settings.todayActionsCollapsedDate = "";
+  }
+  for (const goal of state.goals || []) {
+    const todayNotifications = goal.notifiedRecords?.[dateKey];
+    goal.notifiedRecords = todayNotifications ? { [dateKey]: todayNotifications } : {};
+  }
+}
+
+// 旧数据加载后立即以当前格式落盘，之后不再重复迁移。
+pruneTransientState();
+save();
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]
   );
 }
-function linkify(s) {
-  const escaped = esc(s);
-  return escaped.replace(
+
+function linkify(value) {
+  return esc(value).replace(
     /(https?:\/\/[^\s<]+)/g,
-    '<a data-link="$1">$1</a>'
+    '<a href="$1" data-link="$1">$1</a>'
   );
+}
+
+function timeModeFor(startTime, endTime) {
+  if (!startTime) return "none";
+  return endTime ? "range" : "point";
+}
+
+function timeModeOptions(mode) {
+  return [
+    ["none", "不设时间"],
+    ["point", "时间点"],
+    ["range", "时间段"],
+  ].map(([value, label]) =>
+    `<option value="${value}" ${mode === value ? "selected" : ""}>${label}</option>`
+  ).join("");
+}
+
+function timeRangeLabel(startTime, endTime, emptyLabel = "不设时间") {
+  if (!startTime) return emptyLabel;
+  return endTime ? `${startTime}–${endTime}` : startTime;
+}
+
+function timeRangeAriaLabel(startTime, endTime, emptyLabel = "不设时间") {
+  if (!startTime) return emptyLabel;
+  return endTime ? `${startTime} 至 ${endTime}` : startTime;
+}
+
+function syncTimeEditor(root) {
+  if (!root) return;
+  const mode = root.querySelector("[data-time-mode]")?.value || "none";
+  const fields = root.querySelector("[data-time-fields]");
+  const startInput = root.querySelector("[data-time-start]");
+  const endInput = root.querySelector("[data-time-end]");
+  const endField = root.querySelector("[data-time-end-field]");
+  const startLabel = root.querySelector("[data-time-start-label]");
+  fields?.classList.toggle("hidden", mode === "none");
+  fields?.classList.toggle("point", mode === "point");
+  endField?.classList.toggle("hidden", mode !== "range");
+  if (startLabel) startLabel.textContent = mode === "range" ? "开始时间" : "时间点";
+  if (startInput) startInput.disabled = mode === "none";
+  if (endInput) endInput.disabled = mode !== "range";
+  root.querySelector("[data-time-error]")?.classList.add("hidden");
+  startInput?.removeAttribute("aria-invalid");
+  endInput?.removeAttribute("aria-invalid");
+}
+
+function readTimeEditor(root) {
+  const mode = root?.querySelector("[data-time-mode]")?.value || "none";
+  const startInput = root?.querySelector("[data-time-start]");
+  const endInput = root?.querySelector("[data-time-end]");
+  const startTime = mode === "none" ? "" : startInput?.value || "";
+  const endTime = mode === "range" ? endInput?.value || "" : "";
+  let message = "";
+  let invalidInput = null;
+  if (mode !== "none" && !startTime) {
+    message = mode === "range" ? "请选择开始时间" : "请选择时间点";
+    invalidInput = startInput;
+  } else if (mode === "range" && !endTime) {
+    message = "请选择结束时间";
+    invalidInput = endInput;
+  } else if (mode === "range" && endTime <= startTime) {
+    message = "结束时间需晚于开始时间";
+    invalidInput = endInput;
+  }
+  return { mode, startTime, endTime, message, invalidInput };
+}
+
+function showTimeEditorError(root, result) {
+  const error = root?.querySelector("[data-time-error]");
+  if (error) {
+    error.textContent = result.message;
+    error.classList.remove("hidden");
+  }
+  result.invalidInput?.setAttribute("aria-invalid", "true");
+  result.invalidInput?.focus();
+  root?.classList.add("shake");
+  setTimeout(() => root?.classList.remove("shake"), 300);
 }
 
 const ICONS = {
-  gear: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
+  reminders: '<svg viewBox="0 0 44 44" width="44" height="44" aria-hidden="true"><circle cx="11" cy="13" r="4" fill="#ff9f0a"/><path d="m9.2 13 1.2 1.2 2.3-2.5" fill="none" stroke="white" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="11" cy="22" r="4" fill="#34c759"/><path d="m9.2 22 1.2 1.2 2.3-2.5" fill="none" stroke="white" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="11" cy="31" r="4" fill="#0a84ff"/><path d="m9.2 31 1.2 1.2 2.3-2.5" fill="none" stroke="white" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><path d="M19 13h15M19 22h15M19 31h11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" opacity=".58"/></svg>',
   check: '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>',
-  dots: '<svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>',
-  trash: '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
-  plus: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>',
-  send: '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M12 2 4.5 20l7.5-3.5L19.5 20z" transform="rotate(0 12 12)"/></svg>',
-  arrowUp: '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="8 12 12 8 16 12"/><line x1="12" y1="8" x2="12" y2="16"/></svg>',
-  x: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>',
-  repeat: '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>',
-  note: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>',
-  pencil: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
-  expand: '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>',
-  chevron: '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>',
-  pinOff: '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><line x1="2" y1="2" x2="22" y2="22"/><path d="M12 17v5"/><path d="M9 9v1.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h11"/><path d="M15 9.34V6h1a2 2 0 0 0 0-4H7.89"/></svg>',
-  arrowRight: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>',
-  clock: '<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:2px"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>',
-  download: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
-  upload: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>',
+  plus: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>',
+  arrow: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>',
+  edit: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
+  trash: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4h8v2M19 6l-1 15H6L5 6M10 11v6M14 11v6"/></svg>',
+  gear: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1-2.9 2.9-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21h-4v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1-2.9-2.9.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3v-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.8l-.1-.1 2.9-2.9.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.5V3h4v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1 2.9 2.9-.1.1a1.7 1.7 0 0 0-.3 1.8 1.7 1.7 0 0 0 1.5 1h.1v4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>',
+  empty: '<svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="4" y="3" width="16" height="18" rx="3"/><path d="m8 12 2.4 2.4L16 9M8 6.5h8"/></svg>',
+  close: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m6 6 12 12M18 6 6 18"/></svg>',
+  download: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14"/></svg>',
+  upload: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 17V5m0 0 4 4m-4-4L8 9M5 21h14"/></svg>',
+  target: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 2v3M22 12h-3"/></svg>',
+  repeat: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m17 2 4 4-4 4"/><path d="M3 11V9a3 3 0 0 1 3-3h15"/><path d="m7 22-4-4 4-4"/><path d="M21 13v2a3 3 0 0 1-3 3H3"/></svg>',
+  pause: '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>',
+  play: '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="m8 5 11 7-11 7z"/></svg>',
+  overview: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="4" rx="2"/><rect x="14" y="11" width="7" height="10" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/></svg>',
+  list: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M9 6h11M9 12h11M9 18h11"/><circle cx="4.5" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="4.5" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="4.5" cy="18" r="1" fill="currentColor" stroke="none"/></svg>',
+  calendar: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="3"/><path d="M8 3v4M16 3v4M3 10h18"/><path d="M8 14h.01M12 14h.01M16 14h.01M8 17.5h.01M12 17.5h.01" stroke-width="2.5"/></svg>',
 };
 
-/* ---------------- 渲染 ---------------- */
+function goalSortTimestamp(goal, dateKey = toDateKey()) {
+  if (goal.status === "active") {
+    const todayRoutines = routinesForDate(goal, dateKey);
+    const pendingRoutines = todayRoutines.filter((routine) => !goal.records?.[dateKey]?.[routine.id]);
+    if (pendingRoutines.length) {
+      return Math.min(...pendingRoutines.map((routine) => dueTimestamp({
+        dueDate: dateKey,
+        dueTime: routine.time || "",
+      })));
+    }
+    if (todayRoutines.length) return dueTimestamp({ dueDate: dateKey, dueTime: "" });
+  }
+  return dueTimestamp({ dueDate: goal.targetDate, dueTime: "" });
+}
 
-const app = document.getElementById("app");
-let compact = false;
-let activeMenu = null; // { id, day, kind }
+function timelineTier(entry, dateKey = toDateKey()) {
+  if (entry.kind === "todo") return entry.value.completed ? 4 : 0;
+  const goal = entry.value;
+  if (goal.status === "completed") return 4;
+  if (goal.status === "paused") return 3;
+  const progress = goalDailyProgress(goal, dateKey);
+  if (progress.remaining > 0) return 0;
+  if (progress.total > 0) return 1;
+  return 2;
+}
 
-function applyWindowChrome() {
+function getTimelineEntries() {
+  const dateKey = toDateKey();
+  const entries = [
+    ...state.items.map((item) => ({ kind: "todo", value: item })),
+    ...(state.goals || []).map((goal) => ({ kind: "goal", value: goal })),
+  ].map((entry) => ({
+    entry,
+    tier: timelineTier(entry, dateKey),
+    due: entry.kind === "todo" ? dueTimestamp(entry.value) : goalSortTimestamp(entry.value, dateKey),
+    completedAt: entry.value.completedAt || 0,
+    createdAt: entry.value.createdAt || 0,
+  }));
+  return entries.sort((a, b) => {
+    if (a.tier !== b.tier) return a.tier - b.tier;
+    if (a.tier === 4) return b.completedAt - a.completedAt;
+    if (a.due !== b.due) return a.due - b.due;
+    return a.createdAt - b.createdAt;
+  }).map(({ entry }) => entry);
+}
+
+function limitCompletedEntries(entries) {
+  let completedCount = 0;
+  const visibleEntries = entries.filter((entry) => {
+    const completed = entry.kind === "todo"
+      ? !!entry.value.completed
+      : entry.value.status === "completed";
+    if (!completed) return true;
+    completedCount += 1;
+    return showAllCompleted || completedCount <= COMPLETED_RENDER_LIMIT;
+  });
+  return {
+    entries: visibleEntries,
+    completedCount,
+    hiddenCount: Math.max(0, completedCount - COMPLETED_RENDER_LIMIT),
+  };
+}
+
+function headerStatusSummary() {
+  const pendingTodos = state.items.filter((item) => !item.completed).length;
+  const activeGoals = (state.goals || []).filter((goal) => goal.status === "active").length;
+  const pausedGoals = (state.goals || []).filter((goal) => goal.status === "paused").length;
+  const parts = [];
+  if (pendingTodos) parts.push(`${pendingTodos} 项待办`);
+  if (activeGoals) parts.push(`${activeGoals} 个目标`);
+  if (!pendingTodos && !activeGoals && pausedGoals) parts.push(`${pausedGoals} 个目标已暂停`);
+  return parts.length ? parts.join(" · ") : "全部完成";
+}
+
+function getTodayGoalActions(dateKey = toDateKey()) {
+  const actions = [];
+  (state.goals || [])
+    .filter((goal) => goal.status === "active")
+    .forEach((goal) => {
+      routinesForDate(goal, dateKey).forEach((routine, routineIndex) => {
+        actions.push({
+          goal,
+          routine,
+          routineIndex,
+          completed: goal.records?.[dateKey]?.[routine.id] === true,
+        });
+      });
+    });
+  return actions.sort((a, b) => {
+    if (a.completed !== b.completed) return a.completed ? 1 : -1;
+    const aTime = dueTimestamp({ dueDate: dateKey, dueTime: a.routine.time || "" });
+    const bTime = dueTimestamp({ dueDate: dateKey, dueTime: b.routine.time || "" });
+    if (aTime !== bTime) return aTime - bTime;
+    const goalOrder = (a.goal.createdAt || 0) - (b.goal.createdAt || 0);
+    if (goalOrder !== 0) return goalOrder;
+    return a.routineIndex - b.routineIndex;
+  });
+}
+
+function todayGoalActionsHtml() {
+  const dateKey = toDateKey();
+  const actions = getTodayGoalActions(dateKey);
+  if (!actions.length) return "";
+  const completed = actions.filter((action) => action.completed).length;
+  const allComplete = completed === actions.length;
+  const collapsed = state.settings.todayActionsCollapsedDate === dateKey;
+  const displayedActions = compact
+    ? actions.filter((action) => !action.completed).slice(0, 1)
+    : actions;
+  const showList = !collapsed && (!compact || !allComplete) && displayedActions.length > 0;
+  return `<section class="today-actions-board ${collapsed ? "collapsed" : ""} ${allComplete ? "all-complete" : ""}" aria-labelledby="today-actions-title">
+    <button class="today-actions-head" data-act="today-actions-toggle" aria-expanded="${showList}" aria-controls="today-actions-list">
+      <span class="today-actions-symbol" aria-hidden="true">${ICONS.repeat}</span>
+      <div><h2 id="today-actions-title">今日行动</h2><p>来自 ${new Set(actions.map((action) => action.goal.id)).size} 个阶段目标</p></div>
+      <span class="today-actions-progress" aria-label="今日 ${actions.length} 项行动中已完成 ${completed} 项">${completed}/${actions.length}</span>
+      <span class="today-actions-chevron" aria-hidden="true">${ICONS.arrow}</span>
+    </button>
+    ${showList ? `<ul class="today-actions-list" id="today-actions-list">
+      ${displayedActions.map(({ goal, routine, completed: checked }) => `<li class="today-action-row ${checked ? "done" : ""}">
+        <button class="subtask-check ${checked ? "on" : ""}" data-act="goal-routine-toggle" data-id="${esc(goal.id)}" data-routine-id="${esc(routine.id)}" data-focus-scope="today" role="checkbox" aria-checked="${checked}" aria-label="${checked ? "恢复" : "完成"}今日行动：${esc(routine.title)}">${checked ? ICONS.check : ""}</button>
+        <button class="today-action-main" data-act="goal-reveal" data-id="${esc(goal.id)}" aria-label="查看阶段目标${esc(goal.title)}">
+          <span class="today-action-title">${esc(routine.title)}</span>
+          <span class="today-action-meta"><span class="today-action-goal">${esc(goal.title)}</span><span>·</span><time ${routine.time ? `datetime="${esc(dateKey)}T${esc(routine.time)}"` : ""} aria-label="${esc(timeRangeAriaLabel(routine.time, routine.endTime))}">${esc(timeRangeLabel(routine.time, routine.endTime))}</time></span>
+        </button>
+        <span class="today-action-arrow" aria-hidden="true">${ICONS.arrow}</span>
+      </li>`).join("")}
+    </ul>` : ""}
+  </section>`;
+}
+
+function shortDateLabel(dateKey) {
+  const date = fromDateKey(dateKey);
+  if (!date) return "未设日期";
+  const prefix = date.getFullYear() === new Date().getFullYear() ? "" : `${date.getFullYear()}年`;
+  return `${prefix}${date.getMonth() + 1}月${date.getDate()}日`;
+}
+
+function compactRelativeLabel(dateKey) {
+  const days = dayDistance(dateKey);
+  if (!Number.isFinite(days)) return "";
+  if (days === 0) return "今天";
+  if (days > 0) return `剩余 ${days} 天`;
+  return `逾期 ${Math.abs(days)} 天`;
+}
+
+function horizonDateLabel(dateKey) {
+  const date = fromDateKey(dateKey);
+  if (!date) return "未设日期";
+  const monthDay = `${date.getMonth() + 1}/${date.getDate()}`;
+  return date.getFullYear() === new Date().getFullYear()
+    ? monthDay
+    : `${date.getFullYear()}/${monthDay}`;
+}
+
+function horizonDistanceLabel(dateKey) {
+  const days = dayDistance(dateKey);
+  if (!Number.isFinite(days)) return "";
+  if (days === 0) return "今天";
+  if (days > 0) return `剩${days}天`;
+  return `逾期${Math.abs(days)}天`;
+}
+
+function todayHeaderLabel() {
+  const date = new Date();
+  const weekdays = ["日", "一", "二", "三", "四", "五", "六"];
+  return `${date.getMonth() + 1}月${date.getDate()}日 · 星期${weekdays[date.getDay()]}`;
+}
+
+function rowHtml(item) {
+  const expanded = !compact && state.expandedIds.includes(item.id);
+  const distance = dayDistance(item.dueDate);
+  const distanceClass = distance < 0 ? "overdue" : distance === 0 ? "today" : "";
+  const statusClass = item.completed ? "completed" : "pending";
+  const statusText = item.completed ? "已完成" : "待完成";
+  const itemTimeLabel = timeRangeLabel(item.dueTime, item.dueEndTime, "");
+  const dateTimeText = `${shortDateLabel(item.dueDate)}${itemTimeLabel ? ` ${itemTimeLabel}` : ""}`;
+  const subtasks = Array.isArray(item.subtasks) ? item.subtasks : [];
+  const completedSubtasks = subtasks.filter((subtask) => subtask.completed).length;
+  const subtasksHtml = expanded && subtasks.length
+    ? `<section class="subtask-section" aria-label="子待办">
+        <div class="subtask-head"><span>子待办</span><span aria-label="${subtasks.length} 个子待办中已完成 ${completedSubtasks} 个">${completedSubtasks}/${subtasks.length} 已完成</span></div>
+        <ul class="subtask-list" aria-label="${esc(item.title)}的子待办">
+          ${subtasks.map((subtask) => `<li class="subtask-row ${subtask.completed ? "done" : ""}">
+            <button class="subtask-check ${subtask.completed ? "on" : ""}" data-act="subtask-toggle" data-id="${esc(item.id)}" data-subtask-id="${esc(subtask.id)}" role="checkbox" aria-checked="${subtask.completed}" aria-label="${subtask.completed ? "恢复" : "完成"}子待办：${esc(subtask.title)}">${subtask.completed ? ICONS.check : ""}</button>
+            <span>${esc(subtask.title)}</span>
+          </li>`).join("")}
+        </ul>
+      </section>`
+    : "";
+  const details = expanded
+    ? `<div class="todo-expanded">
+        ${item.detail
+          ? `<div class="description">${linkify(item.detail)}</div>`
+          : subtasks.length ? "" : '<div class="description muted">暂无更多说明</div>'}
+        ${subtasksHtml}
+        <div class="expanded-footer">
+          <div class="row-actions">
+            <button class="text-action" data-act="edit" data-id="${item.id}">${ICONS.edit} 编辑</button>
+            <button class="text-action danger" data-act="delete" data-id="${item.id}">${ICONS.trash} 删除</button>
+          </div>
+        </div>
+      </div>`
+    : "";
+
+  const detailsId = `todo-details-${item.id}`;
+  return `<article class="todo-row ${item.completed ? "done" : ""} ${expanded ? "expanded" : ""}" data-id="${item.id}">
+    <div class="todo-summary">
+      <button class="check ${item.completed ? "on" : ""}" data-act="toggle" data-id="${item.id}" aria-pressed="${item.completed}" aria-label="${item.completed ? `恢复待办：${esc(item.title)}` : `完成待办：${esc(item.title)}`}">${item.completed ? ICONS.check : ""}</button>
+      <button class="todo-main" data-act="expand" data-id="${item.id}" aria-expanded="${expanded}" aria-controls="${detailsId}">
+        <span class="todo-title">${esc(item.title)}</span>
+        <span class="todo-meta">
+          <span class="meta-status ${statusClass}">${statusText}</span>
+          <span class="meta-dot">·</span>
+          <time class="meta-date" datetime="${esc(item.dueDate)}${item.dueTime ? `T${esc(item.dueTime)}` : ""}" aria-label="${esc(`${shortDateLabel(item.dueDate)}${itemTimeLabel ? ` ${timeRangeAriaLabel(item.dueTime, item.dueEndTime)}` : ""}`)}">${esc(dateTimeText)}</time>
+          ${item.completed ? "" : `<span class="meta-dot">·</span><span class="meta-relative ${distanceClass}" data-relative="${esc(item.dueDate)}">${compactRelativeLabel(item.dueDate)}</span>`}
+          ${subtasks.length ? `<span class="meta-dot">·</span><span class="meta-subtasks" aria-label="${subtasks.length} 个子待办中已完成 ${completedSubtasks} 个">${completedSubtasks}/${subtasks.length} 子待办</span>` : ""}
+        </span>
+      </button>
+      <span class="chevron ${expanded ? "up" : ""}" data-act="expand" data-id="${esc(item.id)}" aria-hidden="true">${ICONS.arrow}</span>
+    </div>
+    ${expanded ? details.replace('<div class="todo-expanded">', `<div class="todo-expanded" id="${detailsId}">`) : ""}
+  </article>`;
+}
+
+function goalDailyProgress(goal, dateKey = toDateKey()) {
+  return goalProgressForDate(goal, dateKey);
+}
+
+function goalCumulativeCompletions(goal) {
+  return Object.entries(goal.records || {}).reduce((total, [dateKey, record]) => {
+    const scheduledIds = new Set(routinesForDate(goal, dateKey).map((routine) => routine.id));
+    return total + Object.entries(record || {})
+      .filter(([id, completed]) => completed === true && scheduledIds.has(id)).length;
+  }, 0);
+}
+
+function goalStatusText(goal, progress, targetDistance) {
+  if (goal.status === "completed") return "目标已完成";
+  if (goal.status === "paused") return "已暂停";
+  if (targetDistance < 0) return "目标已到期";
+  if (!progress.total) return "今日无计划";
+  if (progress.completed === progress.total) return "今日已完成";
+  return `今日 ${progress.completed}/${progress.total}`;
+}
+
+function goalRowHtml(goal) {
+  const dateKey = toDateKey();
+  const expanded = !compact && state.expandedIds.includes(goal.id);
+  const progress = goalDailyProgress(goal, dateKey);
+  const targetDistance = dayDistance(goal.targetDate);
+  const statusText = goalStatusText(goal, progress, targetDistance);
+  const targetRelative = compactRelativeLabel(goal.targetDate);
+  const completedToday = progress.total > 0 && progress.completed === progress.total;
+  const goalFinished = goal.status === "completed";
+  const progressRatio = goalFinished ? 1 : progress.total ? progress.completed / progress.total : 0;
+  const detailsId = `goal-details-${goal.id}`;
+
+  let details = "";
+  if (expanded) {
+    const week = goalWeekStats(goal, new Date());
+    const cumulative = goalCumulativeCompletions(goal);
+    const routineList = goal.status === "active" && progress.routines.length
+      ? `<ul class="goal-routine-list" aria-label="${esc(goal.title)}的今日计划">
+          ${progress.routines.map((routine) => {
+            const checked = !!goal.records?.[dateKey]?.[routine.id];
+            return `<li class="goal-routine-row ${checked ? "done" : ""}">
+              <span class="subtask-check goal-routine-indicator ${checked ? "on" : ""}" role="img" aria-label="${checked ? "已完成" : "未完成"}">${checked ? ICONS.check : ""}</span>
+              <span class="goal-routine-copy"><strong>${esc(routine.title)}</strong><small aria-label="${esc(timeRangeAriaLabel(routine.time, routine.endTime))}">${esc(timeRangeLabel(routine.time, routine.endTime))}</small></span>
+            </li>`;
+          }).join("")}
+        </ul>`
+      : `<div class="goal-routine-empty">${
+          goal.status === "paused" ? "目标已暂停，恢复后继续今日计划" :
+          goal.status === "completed" ? "这个阶段目标已经完成" :
+          targetDistance < 0 ? "目标日期已到，可以完成目标或延长日期" :
+          "今天没有安排重复行动"
+        }</div>`;
+
+    details = `<div class="todo-expanded goal-expanded" id="${esc(detailsId)}">
+        ${goal.detail ? `<div class="description">${linkify(goal.detail)}</div>` : ""}
+        <section class="goal-today-section" aria-label="今日计划">
+          <div class="goal-section-head"><span>今日计划</span>${goal.status === "active" && progress.total ? '<button data-act="today-actions-reveal">在顶部直接操作</button>' : ""}<span aria-label="今日 ${progress.total} 项行动中已完成 ${progress.completed} 项">${progress.completed}/${progress.total}</span></div>
+          ${routineList}
+        </section>
+        <div class="goal-insights" aria-label="目标执行统计">
+          <span><b>${week.completed}/${week.total}</b> 本周行动</span>
+          <span><b>${cumulative}</b> 累计完成</span>
+        </div>
+        <div class="goal-deadline"><span>${ICONS.target}</span><div><small>目标日期</small><strong>${esc(shortDateLabel(goal.targetDate))} · ${esc(targetRelative)}</strong></div></div>
+        <div class="expanded-footer goal-actions">
+          <div class="row-actions">
+            <button class="text-action" data-act="goal-edit" data-id="${esc(goal.id)}">${ICONS.edit} 编辑</button>
+            ${goal.status === "completed" ? "" : `<button class="text-action" data-act="goal-pause" data-id="${esc(goal.id)}">${goal.status === "paused" ? ICONS.play : ICONS.pause} ${goal.status === "paused" ? "继续" : "暂停"}</button>`}
+            <button class="text-action" data-act="goal-complete" data-id="${esc(goal.id)}">${goal.status === "completed" ? ICONS.repeat : ICONS.check} ${goal.status === "completed" ? targetDistance < 0 ? "延长并重新开启" : "重新开启" : "完成目标"}</button>
+            <button class="text-action danger" data-act="goal-delete" data-id="${esc(goal.id)}">${ICONS.trash} 删除</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  return `<article class="todo-row goal-row ${goal.status === "completed" ? "done" : ""} ${expanded ? "expanded" : ""}" data-id="${esc(goal.id)}">
+    <div class="todo-summary goal-summary">
+      <div class="goal-progress ${completedToday || goalFinished ? "complete" : ""} ${goal.status}" style="--goal-progress:${progressRatio}" role="img" aria-label="${goalFinished ? "阶段目标已完成" : `今日 ${progress.total} 项行动中已完成 ${progress.completed} 项`}">
+        ${completedToday || goalFinished ? ICONS.check : `<span>${progress.total ? progress.completed : "·"}</span>`}
+      </div>
+      <button class="todo-main" data-act="expand" data-id="${esc(goal.id)}" aria-expanded="${expanded}" aria-controls="${esc(detailsId)}">
+        <span class="goal-title-line"><span class="todo-title">${esc(goal.title)}</span><span class="goal-tag">阶段目标</span></span>
+        <span class="todo-meta goal-meta">
+          <span class="meta-status goal-state ${goal.status}">${esc(statusText)}</span>
+          <span class="meta-dot">·</span>
+          <time class="meta-date" datetime="${esc(goal.targetDate)}">${esc(shortDateLabel(goal.targetDate))}</time>
+          <span class="meta-dot goal-deadline-dot">·</span>
+          <span class="meta-relative goal-relative ${targetDistance < 0 ? "overdue" : ""}" data-relative="${esc(goal.targetDate)}">${esc(targetRelative)}</span>
+        </span>
+      </button>
+      <span class="chevron ${expanded ? "up" : ""}" data-act="expand" data-id="${esc(goal.id)}" aria-hidden="true">${ICONS.arrow}</span>
+    </div>
+    ${details}
+  </article>`;
+}
+
+function getOverviewTodayActions(dateKey = toDateKey()) {
+  const todoActions = state.items
+    .filter((item) => {
+      const distance = dayDistance(item.dueDate);
+      if (!Number.isFinite(distance) || distance > 0) return false;
+      return !item.completed || item.dueDate === dateKey;
+    })
+    .map((item) => ({
+      kind: "todo",
+      id: item.id,
+      title: item.title,
+      context: item.dueDate === dateKey ? "普通待办" : compactRelativeLabel(item.dueDate),
+      dateKey: item.dueDate,
+      startTime: item.dueTime || "",
+      endTime: item.dueEndTime || "",
+      completed: !!item.completed,
+      createdAt: item.createdAt || 0,
+    }));
+  const routineActions = getTodayGoalActions(dateKey).map(({ goal, routine, completed }) => ({
+    kind: "routine",
+    id: goal.id,
+    routineId: routine.id,
+    title: routine.title,
+    context: goal.title,
+    dateKey,
+    startTime: routine.time || "",
+    endTime: routine.endTime || "",
+    completed,
+    createdAt: goal.createdAt || 0,
+  }));
+
+  return [...todoActions, ...routineActions].sort((a, b) => {
+    if (a.completed !== b.completed) return a.completed ? 1 : -1;
+    const aTimestamp = dueTimestamp({ dueDate: a.dateKey, dueTime: a.startTime });
+    const bTimestamp = dueTimestamp({ dueDate: b.dateKey, dueTime: b.startTime });
+    if (aTimestamp !== bTimestamp) return aTimestamp - bTimestamp;
+    return a.createdAt - b.createdAt;
+  });
+}
+
+function overviewActionRowHtml(action) {
+  const isTodo = action.kind === "todo";
+  const toggleAct = isTodo ? "toggle" : "goal-routine-toggle";
+  const revealAct = isTodo ? "todo-reveal" : "goal-reveal";
+  const timeLabel = timeRangeLabel(action.startTime, action.endTime, "");
+  const overdue = isTodo && dayDistance(action.dateKey) < 0;
+  return `<li class="overview-action ${action.completed ? "done" : ""} ${overdue ? "overdue" : ""}">
+    <button class="overview-check ${action.completed ? "on" : ""}" data-act="${toggleAct}" data-id="${esc(action.id)}" ${isTodo ? "" : `data-routine-id="${esc(action.routineId)}" data-focus-scope="overview"`} role="checkbox" aria-checked="${action.completed}" aria-label="${action.completed ? "恢复" : "完成"}${esc(action.title)}">${action.completed ? ICONS.check : ""}</button>
+    <button class="overview-action-main" data-act="${revealAct}" data-id="${esc(action.id)}" aria-label="查看${esc(action.title)}详情">
+      <span class="overview-action-title">${esc(action.title)}</span>
+      <span class="overview-action-context ${overdue ? "overdue" : ""}">${esc(action.context)}</span>
+    </button>
+    ${timeLabel ? `<time class="overview-action-time" datetime="${esc(action.dateKey)}T${esc(action.startTime)}" aria-label="${esc(timeRangeAriaLabel(action.startTime, action.endTime))}">${esc(timeLabel)}</time>` : ""}
+  </li>`;
+}
+
+function overviewTodayHtml(actions) {
+  const completed = actions.filter((action) => action.completed).length;
+  const pending = actions.filter((action) => !action.completed);
+  const visible = pending.slice(0, 5);
+  const hiddenCount = Math.max(0, pending.length - visible.length);
+  const density = pending.length <= 2 ? "comfortable" : pending.length === 3 ? "balanced" : "dense";
+  return `<section class="overview-card overview-today ${density}" aria-labelledby="overview-today-title">
+    <div class="overview-section-head">
+      <div><h2 id="overview-today-title">今日行动</h2><p>${pending.length ? "今天真正需要推进的事" : completed ? `今天已完成 ${completed} 项` : "让今天保持一点余白"}</p></div>
+      ${actions.length ? `<button class="overview-count" data-act="open-today-sheet" aria-label="查看全部今日行动">${completed}/${actions.length}${ICONS.arrow}</button>` : ""}
+    </div>
+    ${pending.length
+      ? `<ul class="overview-action-list">${visible.map(overviewActionRowHtml).join("")}</ul>
+         ${hiddenCount ? `<button class="overview-more" data-act="open-today-sheet">另外 ${hiddenCount} 项今日行动 ${ICONS.arrow}</button>` : ""}`
+      : completed
+        ? `<button class="overview-completed-summary" data-act="open-today-sheet"><span class="overview-empty-check">${ICONS.check}</span><span><strong>今日行动已完成</strong><small>${completed} 项已收起，点击查看</small></span>${ICONS.arrow}</button>`
+      : `<button class="overview-empty-action" data-act="new-menu"><span class="overview-empty-check">${ICONS.check}</span><span><strong>今天没有待完成事项</strong><small>需要时，点一下添加</small></span>${ICONS.plus}</button>`}
+  </section>`;
+}
+
+function overviewEntryButtonHtml(entry, className = "") {
+  return `<button class="${className}" data-act="horizon-reveal" data-kind="${esc(entry.kind)}" data-id="${esc(entry.id)}" aria-label="查看${esc(entry.title)}，${esc(shortDateLabel(entry.dateKey))}，${esc(compactRelativeLabel(entry.dateKey))}">`;
+}
+
+function horizonBucketEntryHtml(entry) {
+  return `${overviewEntryButtonHtml(entry, `horizon-entry ${entry.kind}`)}
+    <span class="horizon-entry-title">${esc(entry.title)}</span>
+    <small><time datetime="${esc(entry.dateKey)}">${esc(horizonDateLabel(entry.dateKey))}</time><span>${esc(horizonDistanceLabel(entry.dateKey))}</span></small>
+  </button>`;
+}
+
+function horizonBucketHtml(key, label, entries, allEntries = entries) {
+  if (!entries.length && !allEntries.length) {
+    return `<div class="horizon-band empty"><span class="horizon-band-label">${label}</span><span class="horizon-band-empty">暂无安排</span></div>`;
+  }
+  if (!entries.length) {
+    return `<button class="horizon-band nearest-only" data-act="open-horizon-bucket" data-bucket="${esc(key)}" aria-label="查看${label}的 ${allEntries.length} 个节点"><span class="horizon-band-label">${label}</span>
+      <span class="horizon-band-copy"><strong>${allEntries.length} 个节点</strong><small>最近节点已在上方显示</small></span><span class="horizon-band-arrow">${ICONS.arrow}</span></button>`;
+  }
+  const visible = entries.slice(0, 3);
+  return `<div class="horizon-band has-entries">
+    <div class="horizon-band-heading"><span class="horizon-band-label">${label}</span><button class="horizon-band-total" data-act="open-horizon-bucket" data-bucket="${esc(key)}" aria-label="查看${label}全部 ${allEntries.length} 个节点">共${allEntries.length}${ICONS.arrow}</button></div>
+    <div class="horizon-entry-list">${visible.map(horizonBucketEntryHtml).join("")}</div>
+  </div>`;
+}
+
+function horizonOverviewHtml(futureEntries) {
+  const nearest = futureEntries[0];
+  const remainingEntries = nearest
+    ? futureEntries.filter((entry) => !(entry.kind === nearest.kind && entry.id === nearest.id))
+    : futureEntries;
+  const allBuckets = bucketFutureHorizonEntries(futureEntries);
+  const buckets = bucketFutureHorizonEntries(remainingEntries);
+  return `<section class="overview-card nearest-card" aria-labelledby="nearest-title">
+      <div class="overview-section-kicker" id="nearest-title">最近节点</div>
+      ${nearest
+        ? `${overviewEntryButtonHtml(nearest, `nearest-node ${nearest.kind}`)}
+            <span class="nearest-icon">${nearest.kind === "goal" ? ICONS.target : ICONS.calendar}</span>
+            <span class="nearest-copy"><small>${nearest.kind === "goal" ? "阶段目标" : "重要节点"}</small><strong>${esc(nearest.title)}</strong><span><time datetime="${esc(nearest.dateKey)}">${esc(shortDateLabel(nearest.dateKey))}</time> · ${esc(compactRelativeLabel(nearest.dateKey))}</span></span>
+            <span class="nearest-arrow">${ICONS.arrow}</span></button>`
+        : `<button class="nearest-node empty" data-act="new-menu"><span class="nearest-icon">${ICONS.calendar}</span><span class="nearest-copy"><strong>还没有未来节点</strong><span>添加考试、比赛或截止日期</span></span>${ICONS.plus}</button>`}
+    </section>
+    <section class="overview-card horizon-card" aria-labelledby="horizon-title">
+      <div class="overview-section-head compact-head"><div><h2 id="horizon-title">时间地平线</h2><p>${futureEntries.length ? `${futureEntries.length} 个未来节点` : "未来安排会在这里展开"}</p></div></div>
+      <div class="horizon-bands">
+        ${horizonBucketHtml("within30Days", "30天内", buckets.within30Days, allBuckets.within30Days)}
+        ${horizonBucketHtml("within90Days", "31–90天", buckets.within90Days, allBuckets.within90Days)}
+        ${horizonBucketHtml("beyond90Days", "90天后", buckets.beyond90Days, allBuckets.beyond90Days)}
+      </div>
+    </section>`;
+}
+
+function overviewGoalsHtml(todayActionCount, horizonDensity = 1) {
+  const goals = (state.goals || [])
+    .filter((goal) => goal.status !== "completed")
+    .sort((a, b) => {
+      const aDistance = dayDistance(a.targetDate);
+      const bDistance = dayDistance(b.targetDate);
+      if (Number.isFinite(aDistance) !== Number.isFinite(bDistance)) return Number.isFinite(aDistance) ? -1 : 1;
+      if (Number.isFinite(aDistance) && aDistance !== bDistance) return aDistance - bDistance;
+      if (a.status !== b.status) return a.status === "active" ? -1 : 1;
+      return (a.createdAt || 0) - (b.createdAt || 0);
+    });
+  const narrowVisibleLimit = todayActionCount >= 4
+    ? (horizonDensity >= 2 ? 1 : 2)
+    : (horizonDensity >= 2 ? 2 : 3);
+  const visibleLimit = overviewWidthTier === 2
+    ? 6
+    : overviewWidthTier === 1
+      ? 4
+      : narrowVisibleLimit;
+  const visibleGoals = goals.slice(0, visibleLimit);
+  const hiddenCount = Math.max(0, goals.length - visibleGoals.length);
+  return `<section class="overview-card overview-goals ${horizonDensity >= 2 ? "horizon-dense" : ""}" aria-labelledby="overview-goals-title">
+    <div class="overview-section-head compact-head">
+      <div><h2 id="overview-goals-title">阶段目标</h2><p>${goals.length ? "用今天的行动靠近目标" : "为长期计划建立节奏"}</p></div>
+      ${goals.length ? `<button class="overview-count" data-act="view-list" aria-label="在完整清单中查看全部阶段目标">${goals.length} 个${ICONS.arrow}</button>` : ""}
+    </div>
+    ${visibleGoals.length ? `<div class="overview-goal-list">${visibleGoals.map((goal) => {
+      const today = goalDailyProgress(goal);
+      const week = goalWeekStats(goal, new Date());
+      const overdue = dayDistance(goal.targetDate) < 0;
+      const validTargetDate = !!fromDateKey(goal.targetDate);
+      const targetMeta = validTargetDate
+        ? `${shortDateLabel(goal.targetDate)} · ${compactRelativeLabel(goal.targetDate)}`
+        : "未设置目标日期 · 去补充";
+      return `<button class="overview-goal ${goal.status} ${overdue ? "overdue" : ""}" data-act="goal-reveal" data-id="${esc(goal.id)}">
+        <span class="overview-goal-mark">${goal.status === "paused" ? ICONS.pause : ICONS.target}</span>
+        <span class="overview-goal-copy"><strong>${esc(goal.title)}</strong><small>${validTargetDate ? `<time datetime="${esc(goal.targetDate)}">${esc(targetMeta)}</time>` : esc(targetMeta)}</small></span>
+        <span class="overview-goal-stats">${today.total ? `<b>今日 ${today.completed}/${today.total}</b>` : ""}${week.total ? `<small>本周 ${week.completed}/${week.total}</small>` : `<small>${goal.status === "paused" ? "已暂停" : "今日无计划"}</small>`}</span>
+        <span class="overview-goal-arrow">${ICONS.arrow}</span>
+      </button>`;
+    }).join("")}</div>` : `<button class="overview-goal-empty" data-act="new-menu"><span>${ICONS.target}</span><strong>建立一个阶段目标</strong><small>把考试或比赛拆成每天能做的行动</small></button>`}
+    ${hiddenCount ? `<button class="overview-more goal-more" data-act="view-list">另外 ${hiddenCount} 个目标，在完整清单中查看 ${ICONS.arrow}</button>` : ""}
+  </section>`;
+}
+
+function overviewDockHtml(view) {
+  return `<footer class="overview-dock" aria-label="主导航">
+    <button class="dock-tab ${view === "overview" ? "active" : ""}" data-act="view-overview" aria-current="${view === "overview" ? "page" : "false"}">${ICONS.overview}<span>全景</span></button>
+    <button class="dock-add" data-act="new-menu" aria-label="新建">${ICONS.plus}</button>
+    <button class="dock-tab ${view === "list" ? "active" : ""}" data-act="view-list" aria-current="${view === "list" ? "page" : "false"}">${ICONS.list}<span>清单</span></button>
+  </footer>`;
+}
+
+function applyAppearance() {
   const root = document.documentElement;
   root.dataset.theme = state.settings.appearance;
   root.style.setProperty("--opacity", state.settings.opacity);
@@ -349,616 +764,1482 @@ function applyWindowChrome() {
     root.style.removeProperty("--panel-top");
     root.style.removeProperty("--panel-bottom");
   }
-  if (appWindow) {
-    appWindow.setAlwaysOnTop(!!state.settings.alwaysOnTop).catch(() => {});
-    appWindow.setIgnoreCursorEvents(!!state.settings.clickThrough).catch(() => {});
+  const alwaysOnTop = !!state.settings.alwaysOnTop;
+  if (appWindow && alwaysOnTop !== appliedAlwaysOnTop) {
+    appliedAlwaysOnTop = alwaysOnTop;
+    appWindow.setAlwaysOnTop(alwaysOnTop).catch(() => {
+      if (appliedAlwaysOnTop === alwaysOnTop) appliedAlwaysOnTop = undefined;
+    });
   }
-}
-
-function rowHtml(it, day, kind) {
-  const badge = kind === "recurring" && compact ? `<span class="badge">${ICONS.repeat}</span>` : "";
-  const detail =
-    !compact && it.detail
-      ? `<div class="detail">${linkify(it.detail)}</div>`
-      : "";
-  let actions = "";
-  if (!compact) {
-    if (kind === "recurring") {
-      actions = `<div class="actions">
-        <button class="icon-btn sm" data-act="unpin" data-id="${it.id}" title="取消每天">${ICONS.pinOff}</button>
-        <button class="icon-btn sm" data-act="rdel" data-id="${it.id}" title="删除">${ICONS.trash}</button>
-      </div>`;
-    } else {
-      actions = `<div class="actions">
-        <button class="icon-btn sm" data-act="menu" data-id="${it.id}" data-day="${day}" title="更多">${ICONS.dots}</button>
-        <button class="icon-btn sm" data-act="del" data-id="${it.id}" data-day="${day}" title="删除">${ICONS.trash}</button>
-      </div>`;
-    }
+  const clickThrough = !!state.settings.clickThrough;
+  if (appWindow && clickThrough !== appliedClickThrough) {
+    appliedClickThrough = clickThrough;
+    appWindow.setIgnoreCursorEvents(clickThrough).catch(() => {
+      if (appliedClickThrough === clickThrough) appliedClickThrough = undefined;
+    });
   }
-  const editAct = kind === "recurring" ? "redit" : "edit";
-  const timeChip = it.time ? `<span class="time-chip">${ICONS.clock}${it.time}</span>` : "";
-  const streakChip =
-    kind === "recurring" && it.streak > 0
-      ? `<span class="streak-chip" title="已连续 ${it.streak} 天">🔥${it.streak}</span>`
-      : "";
-  return `<div class="row ${it.completed ? "done" : ""}" data-row="${it.id}">
-    <div class="check ${it.completed ? "on" : ""}" data-act="${kind === "recurring" ? "rtoggle" : "toggle"}" data-id="${it.id}" data-day="${day}">${it.completed ? ICONS.check : ""}</div>
-    <div class="body" data-act="${editAct}" data-id="${it.id}" data-day="${day}">
-      <div class="title">${esc(it.title)}${timeChip}${streakChip}</div>
-      ${detail}
-    </div>
-    ${badge}${actions}
-  </div>`;
 }
 
 function render() {
-  rollOverIfNeeded();
-  applyWindowChrome();
-
-  const day = compact ? "today" : state.selectedDay;
-  const showRecurring = day === "today" && state.recurringItems.length > 0;
-  const cnt = incompleteCount();
-
-  let html = "";
-
-  if (!compact) {
-    const sub =
-      cnt === 0 ? "这一页已经清空" : `${DAY_TITLE[state.selectedDay]}还有 ${cnt} 件事`;
-    html += `<div class="header">
-      <div class="titles"><h1>悬浮待办</h1><p>${sub}</p></div>
-      <div class="spacer"></div>
-      <div class="count-pill ${cnt === 0 ? "zero" : ""}">${cnt}</div>
-      <button class="icon-btn" data-act="settings" title="设置">${ICONS.gear}</button>
-    </div>`;
-
-    html += `<div class="day-picker">`;
-    DAYS.forEach((d, i) => {
-      html += `<div class="day-seg ${state.selectedDay === d ? "sel" : ""}" data-act="day" data-day="${d}">
-        <span class="t">${DAY_TITLE[d]}</span><span class="d">${dateLabel(i)}</span>
-      </div>`;
-    });
-    html += `</div>`;
-  }
-
-  if (showRecurring) {
-    html += `<div class="recurring"><div class="head">
-      <span class="ic">${ICONS.repeat}</span><span>每天</span><div class="spacer"></div>`;
-    if (!compact)
-      html += `<button class="icon-btn sm" data-act="raddtoggle" title="添加每天常驻待办">${ICONS.plus}</button>`;
-    html += `</div>`;
-    state.recurringItems.forEach((it) => (html += rowHtml(it, "today", "recurring")));
-    if (!compact && recurringComposerOpen) {
-      html += `<div class="composer sm"><span class="ic">${ICONS.repeat}</span>
-        <input id="recur-input" placeholder="添加每天常驻待办" value="${esc(recurDraft)}"/>
-        <button class="send" data-act="raddsubmit">${ICONS.arrowUp}</button></div>`;
-    }
-    html += `</div>`;
-  }
-
-  // 列表
-  const list = items(day);
-  if (list.length === 0) {
-    const a = showRecurring ? `${DAY_TITLE[day]}没有临时待办` : `${DAY_TITLE[day]}还没有待办`;
-    const b = showRecurring ? "上方是每天常驻的事" : "写下一件真正要推进的事";
-    html += `<div class="empty"><div class="ic">${ICONS.note}</div><div class="a">${a}</div><div class="b">${b}</div></div>`;
-  } else {
-    html += `<div class="list">`;
-    list.forEach((it) => (html += rowHtml(it, day, "normal")));
-    html += `</div>`;
-  }
-
-  if (!compact) {
-    if (completedCount(day) > 0) {
-      html += `<div class="clear-bar"><button data-act="clear" data-day="${day}">${ICONS.trash}<span>清除已完成（${completedCount(day)}）</span></button></div>`;
-    }
-    // 输入框
-    const editing = composerEditId;
-    html += `<div class="composer">
-      <span class="ic">${editing ? ICONS.pencil : ICONS.plus}</span>
-      <input id="main-input" placeholder="${editing ? "编辑待办标题" : "添加" + DAY_TITLE[state.selectedDay] + "待办"}" value="${esc(draft)}"/>
-      ${editing ? `<button class="icon-btn sm" data-act="canceledit">${ICONS.x}</button>` : ""}
-      <button class="send ${draft.trim() ? "" : "off"}" data-act="submit">${editing ? ICONS.arrowUp : ICONS.arrowUp}</button>
-    </div>`;
-
-    // 备忘录
-    if (state.settings.memoEnabled) {
-      html += `<div class="memo"><div class="head" data-act="memotoggle">
-        <span class="ic">${ICONS.note}</span><span>全局备忘录</span><div class="spacer"></div>
-        <span style="transform:rotate(${state.memo.expanded ? 180 : 0}deg);transition:.2s">${ICONS.chevron}</span></div>`;
-      if (state.memo.expanded) {
-        html += `<textarea id="memo-input" placeholder="记录临时想法、链接、会议号">${esc(state.memo.text)}</textarea>`;
+  const previousMain = app.querySelector(".main-scroll");
+  const previousView = previousMain?.dataset.mainView;
+  if (previousMain && previousView) viewScrollTop[previousView] = previousMain.scrollTop;
+  const activeControl = document.activeElement?.closest?.("[data-act]");
+  const activeKey = activeControl
+    ? {
+        act: activeControl.dataset.act,
+        id: activeControl.dataset.id || "",
+        subtaskId: activeControl.dataset.subtaskId || "",
+        routineId: activeControl.dataset.routineId || "",
+        focusScope: activeControl.dataset.focusScope || "",
       }
-      html += `</div>`;
-    }
-  }
+    : null;
+  applyAppearance();
+  const renderedView = compact ? "list" : activeMainView;
+  const overview = renderedView === "overview";
+  const allEntries = overview ? [] : getTimelineEntries();
+  const completedView = overview
+    ? { entries: [], completedCount: 0, hiddenCount: 0 }
+    : limitCompletedEntries(allEntries);
+  const entries = completedView.entries;
+  const todayActions = overview ? getOverviewTodayActions() : [];
+  const futureEntries = overview ? buildFutureHorizonEntries(state.items, state.goals || []) : [];
+  const horizonBuckets = overview ? bucketFutureHorizonEntries(futureEntries.slice(1)) : null;
+  const horizonDensity = horizonBuckets
+    ? Math.max(0, ...Object.values(horizonBuckets).map((bucket) => Math.min(3, bucket.length)))
+    : 0;
+  const pendingToday = todayActions.filter((action) => !action.completed).length;
+  const subtitle = overview
+    ? `${todayHeaderLabel()} · 今天 ${pendingToday} 项 · 未来 ${futureEntries.length} 个节点`
+    : `${todayHeaderLabel()} · ${headerStatusSummary()}`;
+  const mainContent = overview
+    ? `${overviewTodayHtml(todayActions)}
+      ${horizonOverviewHtml(futureEntries)}
+      ${overviewGoalsHtml(pendingToday, horizonDensity)}`
+    : `${todayGoalActionsHtml()}
+      ${allEntries.length
+        ? entries.map((entry) => entry.kind === "goal" ? goalRowHtml(entry.value) : rowHtml(entry.value)).join("")
+        : `<div class="empty-state">${ICONS.empty}<strong>当前没有待办</strong><span>写下下一件重要的事吧</span></div>`}
+      ${completedView.hiddenCount
+        ? `<button class="completed-overflow" data-act="completed-overflow">${showAllCompleted ? "收起较早完成项" : `显示更早已完成 · ${completedView.hiddenCount}`}</button>`
+        : ""}`;
 
-  // 紧凑模式放大按钮
-  if (compact) {
-    html += `<button class="icon-btn expand-btn" data-act="expand" title="放大">${ICONS.expand}</button>`;
-  }
+  app.innerHTML = `
+    <header class="header ${overview ? "horizon-header" : "list-header"}" data-drag-region>
+      ${overview ? "" : `<div class="app-symbol">${ICONS.reminders}</div>`}
+      <div class="titles"><h1>${overview ? "时间地平线" : "完整清单"}</h1><p aria-live="polite">${esc(subtitle)}</p></div>
+      <div class="spacer"></div>
+      <button class="icon-btn" data-act="settings" title="设置" aria-label="设置">${ICONS.gear}</button>
+    </header>
 
-  app.innerHTML = html;
+    <main class="${overview ? `overview-screen ${pendingToday >= 3 ? "many-today" : ""}` : "timeline"} main-scroll" data-main-view="${renderedView}">${mainContent}</main>
+    ${compact ? "" : overviewDockHtml(renderedView)}
+    ${compact ? '<button class="compact-open" data-act="grow">展开</button>' : ""}
+    <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">${esc(statusAnnouncement)}</div>
+  `;
 
-  // 头部可拖动
-  const header = app.querySelector(".header");
-  if (header) header.addEventListener("mousedown", onDragStart);
-
-  // 保持输入焦点
-  if (focusMain) {
-    const mi = document.getElementById("main-input");
-    if (mi) { mi.focus(); mi.setSelectionRange(mi.value.length, mi.value.length); }
-    focusMain = false;
+  const main = app.querySelector(".main-scroll");
+  if (main) main.scrollTop = viewScrollTop[renderedView] || 0;
+  if (activeKey) {
+    const restored = [...app.querySelectorAll(`[data-act="${activeKey.act}"]`)]
+      .find((element) =>
+        (element.dataset.id || "") === activeKey.id &&
+        (element.dataset.subtaskId || "") === activeKey.subtaskId &&
+        (element.dataset.routineId || "") === activeKey.routineId &&
+        (element.dataset.focusScope || "") === activeKey.focusScope
+      );
+    restored?.focus({ preventScroll: true });
   }
-  if (focusRecur) {
-    const ri = document.getElementById("recur-input");
-    if (ri) ri.focus();
-    focusRecur = false;
-  }
+  statusAnnouncement = "";
 }
 
-/* ---------------- 交互状态 ---------------- */
-
-let draft = "";
-let composerEditId = null;
-let composerEditDay = null;
-let recurDraft = "";
-let recurringComposerOpen = false;
-let recurEditId = null;
-let focusMain = false;
-let focusRecur = false;
-
-function onDragStart(e) {
-  if (e.target.closest("button")) return;
-  appWindow?.startDragging().catch(() => {});
-}
-
-/* 事件委托 */
-app.addEventListener("click", (e) => {
-  const link = e.target.closest("a[data-link]");
-  if (link) { e.preventDefault(); openExternal(link.dataset.link); return; }
-
-  const el = e.target.closest("[data-act]");
-  if (!el) return;
-  const act = el.dataset.act;
-  const id = el.dataset.id;
-  const day = el.dataset.day;
-
-  switch (act) {
-    case "day": state.selectedDay = day; save(); render(); break;
-    case "toggle": {
-      const wasOpen = !state.itemsByDay[day].find((i) => i.id === id)?.completed;
-      toggleItem(id, day);
-      if (wasOpen) celebrate(el);
-      render();
-      break;
-    }
-    case "rtoggle": {
-      const wasOpen = !state.recurringItems.find((i) => i.id === id)?.completed;
-      toggleRecurring(id);
-      if (wasOpen) celebrate(el);
-      render();
-      break;
-    }
-    case "del": deleteItem(id, day); render(); break;
-    case "rdel": deleteRecurring(id); render(); break;
-    case "unpin": unpinRecurring(id); render(); break;
-    case "clear": clearCompleted(day); render(); break;
-    case "edit": startEdit(id, day); break;
-    case "redit": startRecurEdit(id); break;
-    case "submit": commitMain(); break;
-    case "canceledit": cancelEdit(); break;
-    case "raddtoggle": recurringComposerOpen = !recurringComposerOpen; focusRecur = recurringComposerOpen; render(); break;
-    case "raddsubmit": commitRecur(); break;
-    case "expand": expandWindow(); break;
-    case "settings": openSettings(); break;
-    case "memotoggle": state.memo.expanded = !state.memo.expanded; save(); render(); break;
-    case "menu": openRowMenu(id, day, el); break;
+app.addEventListener("mousedown", (event) => {
+  if (event.target.closest(".header") && !event.target.closest("button")) {
+    appWindow?.startDragging().catch(() => {});
   }
 });
 
-/* 输入框事件（委托 input/keydown） */
-app.addEventListener("input", (e) => {
-  if (e.target.id === "main-input") {
-    draft = e.target.value;
-    const send = app.querySelector('[data-act="submit"]');
-    if (send) send.classList.toggle("off", !draft.trim());
-  } else if (e.target.id === "recur-input") {
-    recurDraft = e.target.value;
-  } else if (e.target.id === "memo-input") {
-    state.memo.text = e.target.value;
-    save();
+function addTodo(data) {
+  const title = data.title.trim();
+  if (!title || !data.dueDate) return false;
+  const item = {
+    id: uid(),
+    title,
+    detail: (data.detail || "").trim(),
+    subtasks: (data.subtasks || []).map((subtask) => ({
+      id: subtask.id || uid(),
+      title: subtask.title.trim(),
+      completed: !!subtask.completed,
+    })).filter((subtask) => subtask.title),
+    dueDate: data.dueDate,
+    dueTime: data.dueTime || "",
+    dueEndTime: data.dueEndTime || "",
+    completed: false,
+    completedAt: null,
+    notified: false,
+    createdAt: Date.now(),
+  };
+  state.items.push(item);
+  if (!save()) {
+    state.items = state.items.filter((entry) => entry !== item);
+    return false;
   }
-});
-app.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) {
-    if (e.target.id === "main-input") { e.preventDefault(); commitMain(); }
-    else if (e.target.id === "recur-input") { e.preventDefault(); commitRecur(); }
-  }
-  if (e.key === "Escape" && e.target.id === "main-input") {
-    if (composerEditId) cancelEdit();
-    else { draft = ""; appWindow?.hide().catch(() => {}); }
-  }
-});
+  return true;
+}
 
-function commitMain() {
-  const t = draft.trim();
-  if (!t) return;
-  if (composerEditId) {
-    updateItem(composerEditId, composerEditDay, t, undefined);
-    composerEditId = null; composerEditDay = null;
-  } else {
-    const { day, time, title } = parseQuickInput(t, state.selectedDay);
-    if (!title) return;
-    addItem(title, day, time);
-    if (day !== state.selectedDay) state.selectedDay = day;
-  }
-  draft = ""; focusMain = true; render();
-}
-function startEdit(id, day) {
-  const it = state.itemsByDay[day].find((i) => i.id === id);
-  if (!it) return;
-  state.selectedDay = day;
-  composerEditId = id; composerEditDay = day; draft = it.title; focusMain = true;
-  render();
-}
-function cancelEdit() {
-  composerEditId = null; composerEditDay = null; draft = ""; focusMain = true; render();
-}
-function commitRecur() {
-  const t = recurDraft.trim();
-  if (!t) return;
-  if (recurEditId) { updateRecurringTitle(recurEditId, t); recurEditId = null; }
-  else {
-    const parsed = parseTime(t);
-    const time = parsed ? parsed.time : null;
-    const title = parsed ? t.replace(parsed.match, " ").replace(/\s+/g, " ").trim() : t;
-    if (title) addRecurring(title, time);
-  }
-  recurDraft = ""; focusRecur = true; render();
-}
-function startRecurEdit(id) {
-  const it = state.recurringItems.find((i) => i.id === id);
-  if (!it) return;
-  recurringComposerOpen = true; recurEditId = id; recurDraft = it.title; focusRecur = true;
+function toggleTodo(id) {
+  if (!state.items.some((todo) => todo.id === id)) return;
+  persistMutation(() => {
+    const item = state.items.find((todo) => todo.id === id);
+    const previous = {
+      completed: item.completed,
+      completedAt: item.completedAt,
+      notified: item.notified,
+      subtasks: item.subtasks?.map((subtask) => subtask.completed),
+    };
+    item.completed = !item.completed;
+    if (item.completed) item.subtasks?.forEach((subtask) => { subtask.completed = true; });
+    item.completedAt = item.completed ? Date.now() : null;
+    if (!item.completed) item.notified = false;
+    return () => {
+      item.completed = previous.completed;
+      item.completedAt = previous.completedAt;
+      item.notified = previous.notified;
+      item.subtasks?.forEach((subtask, index) => {
+        subtask.completed = previous.subtasks[index];
+      });
+    };
+  });
   render();
 }
 
-/* ---------------- 行浮层菜单 ---------------- */
-
-function closeMenu() {
-  document.querySelector(".menu")?.remove();
-  document.querySelector(".menu-mask")?.remove();
+function toggleExpanded(id) {
+  state.expandedIds = state.expandedIds.includes(id)
+    ? state.expandedIds.filter((value) => value !== id)
+    : [...state.expandedIds, id];
+  save();
+  render();
 }
-function openRowMenu(id, day, anchorEl) {
-  closeMenu();
-  const it = state.itemsByDay[day].find((i) => i.id === id);
-  if (!it) return;
-  const others = DAYS.filter((d) => d !== day);
-  const mask = document.createElement("div");
-  mask.className = "menu-mask";
-  mask.style.cssText = "position:absolute;inset:0;z-index:55";
-  mask.addEventListener("click", closeMenu);
-  document.body.appendChild(mask);
 
-  const menu = document.createElement("div");
-  menu.className = "menu";
-  menu.innerHTML =
-    `<button data-m="edit">${ICONS.pencil}<span>编辑</span></button>` +
-    `<button data-m="detail">${ICONS.note}<span>${it.detail ? "编辑描述" : "添加描述"}</span></button>` +
-    `<button data-m="pin">${ICONS.repeat}<span>设为每天</span></button>` +
-    `<div class="sep"></div>` +
-    others.map((d) => `<button data-m="move:${d}">${ICONS.arrowRight}<span>移到${DAY_TITLE[d]}</span></button>`).join("") +
-    `<div class="sep"></div>` +
-    `<button class="danger" data-m="del">${ICONS.trash}<span>删除</span></button>`;
-  document.body.appendChild(menu);
+function toggleSubtask(itemId, subtaskId) {
+  const exists = state.items
+    .find((todo) => todo.id === itemId)
+    ?.subtasks?.some((entry) => entry.id === subtaskId);
+  if (!exists) return;
+  persistMutation(() => {
+    const item = state.items.find((todo) => todo.id === itemId);
+    const subtask = item.subtasks.find((entry) => entry.id === subtaskId);
+    const previous = {
+      subtaskCompleted: subtask.completed,
+      itemCompleted: item.completed,
+      completedAt: item.completedAt,
+      notified: item.notified,
+    };
+    subtask.completed = !subtask.completed;
+    if (item.completed && !subtask.completed) {
+      item.completed = false;
+      item.completedAt = null;
+      item.notified = false;
+    }
+    return () => {
+      subtask.completed = previous.subtaskCompleted;
+      item.completed = previous.itemCompleted;
+      item.completedAt = previous.completedAt;
+      item.notified = previous.notified;
+    };
+  });
+  render();
+}
 
-  const r = anchorEl.getBoundingClientRect();
-  const mw = 160, mh = menu.offsetHeight;
-  let left = Math.min(r.right - mw, window.innerWidth - mw - 8);
-  left = Math.max(8, left);
-  let top = r.bottom + 6;
-  if (top + mh > window.innerHeight - 8) top = r.top - mh - 6;
-  menu.style.left = left + "px";
-  menu.style.top = top + "px";
+function toggleGoalRoutine(goalId, routineId) {
+  const goal = (state.goals || []).find((entry) => entry.id === goalId);
+  if (!goal || goal.status !== "active") return;
+  const dateKey = toDateKey();
+  const routine = routinesForDate(goal, dateKey).find((entry) => entry.id === routineId);
+  if (!routine) return;
+  persistMutation(() => {
+    const currentGoal = state.goals.find((entry) => entry.id === goalId);
+    const previousRecords = currentGoal.records;
+    currentGoal.records = { ...(previousRecords || {}) };
+    currentGoal.records[dateKey] = { ...(previousRecords?.[dateKey] || {}) };
+    if (currentGoal.records[dateKey][routineId]) delete currentGoal.records[dateKey][routineId];
+    else currentGoal.records[dateKey][routineId] = true;
+    if (!Object.keys(currentGoal.records[dateKey]).length) delete currentGoal.records[dateKey];
+    const progress = goalDailyProgress(currentGoal, dateKey);
+    statusAnnouncement = progress.completed === progress.total && progress.total
+      ? `${currentGoal.title}的今日计划已全部完成`
+      : `${currentGoal.title}今日已完成 ${progress.completed}/${progress.total}`;
+    return () => { currentGoal.records = previousRecords; };
+  });
+  render();
+}
 
-  menu.addEventListener("click", (e) => {
-    const b = e.target.closest("[data-m]");
-    if (!b) return;
-    const m = b.dataset.m;
-    closeMenu();
-    if (m === "edit") startEdit(id, day);
-    else if (m === "detail") openDetailEditor(id, day);
-    else if (m === "pin") { pinAsRecurring(id, day); render(); }
-    else if (m === "del") { deleteItem(id, day); render(); }
-    else if (m.startsWith("move:")) { moveItem(id, day, m.slice(5)); render(); }
+function closeOpenPausePeriod(goal, resumeDate) {
+  const openIndex = (goal.pausePeriods || []).findLastIndex((period) => !period.endDate);
+  if (openIndex < 0) return;
+  const endDate = addDays(resumeDate, -1);
+  if (endDate < goal.pausePeriods[openIndex].startDate) goal.pausePeriods.splice(openIndex, 1);
+  else goal.pausePeriods[openIndex].endDate = endDate;
+}
+
+function toggleGoalPause(id) {
+  const goal = (state.goals || []).find((entry) => entry.id === id);
+  if (!goal || goal.status === "completed") return;
+  const dateKey = toDateKey();
+  persistMutation(() => {
+    const currentGoal = state.goals.find((entry) => entry.id === id);
+    const previousStatus = currentGoal.status;
+    const previousPausePeriods = currentGoal.pausePeriods;
+    currentGoal.pausePeriods = (previousPausePeriods || []).map((period) => ({ ...period }));
+    if (currentGoal.status === "paused") {
+      currentGoal.status = "active";
+      closeOpenPausePeriod(currentGoal, dateKey);
+    } else {
+      currentGoal.status = "paused";
+      currentGoal.pausePeriods.push({ startDate: dateKey, endDate: "" });
+    }
+    statusAnnouncement = `${currentGoal.title}${currentGoal.status === "paused" ? "已暂停" : "已继续"}`;
+    return () => {
+      currentGoal.status = previousStatus;
+      currentGoal.pausePeriods = previousPausePeriods;
+    };
+  });
+  render();
+}
+
+function toggleGoalComplete(id) {
+  const goal = (state.goals || []).find((entry) => entry.id === id);
+  if (!goal) return;
+  const reopening = goal.status === "completed";
+  if (reopening && dayDistance(goal.targetDate) < 0) {
+    openGoalEditor(id, { reopenOnSave: true });
+    return;
+  }
+  persistMutation(() => {
+    const currentGoal = state.goals.find((entry) => entry.id === id);
+    const previousStatus = currentGoal.status;
+    const previousCompletedAt = currentGoal.completedAt;
+    const previousPausePeriods = currentGoal.pausePeriods;
+    currentGoal.pausePeriods = (previousPausePeriods || []).map((period) => ({ ...period }));
+    if (!reopening && currentGoal.status === "paused") {
+      const openPeriod = (currentGoal.pausePeriods || []).findLast((period) => !period.endDate);
+      if (openPeriod) openPeriod.endDate = toDateKey();
+    }
+    currentGoal.status = reopening ? "active" : "completed";
+    currentGoal.completedAt = reopening ? null : Date.now();
+    if (reopening) closeOpenPausePeriod(currentGoal, toDateKey());
+    else currentGoal.pausePeriods.push({ startDate: addDays(toDateKey(), 1), endDate: "" });
+    statusAnnouncement = `${currentGoal.title}${reopening ? "已重新开启" : "已完成"}`;
+    return () => {
+      currentGoal.status = previousStatus;
+      currentGoal.completedAt = previousCompletedAt;
+      currentGoal.pausePeriods = previousPausePeriods;
+    };
+  });
+  render();
+}
+
+function switchMainView(view) {
+  if (!['overview', 'list'].includes(view) || activeMainView === view) return;
+  activeMainView = view;
+  viewScrollTop[view] = 0;
+  render();
+}
+
+function trapOverlayFocus(overlay, event) {
+  if (event.key !== "Tab") return;
+  const focusable = [...overlay.querySelectorAll('button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')]
+    .filter((element) => element.getClientRects().length > 0);
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable.at(-1);
+  if (event.shiftKey && (document.activeElement === first || !overlay.contains(document.activeElement))) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && (document.activeElement === last || !overlay.contains(document.activeElement))) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+async function revealTodo(id) {
+  if (!state.items.some((item) => item.id === id)) return;
+  activeMainView = "list";
+  if (!state.expandedIds.includes(id)) state.expandedIds.push(id);
+  if (compact) await expandWindow();
+  save();
+  render();
+  requestAnimationFrame(() => {
+    const card = [...app.querySelectorAll(".todo-row:not(.goal-row)")]
+      .find((element) => element.dataset.id === id);
+    card?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    card?.querySelector('.todo-main[data-act="expand"]')?.focus({ preventScroll: true });
   });
 }
 
-/* 描述编辑弹窗 */
-function openDetailEditor(id, day) {
-  const it = state.itemsByDay[day].find((i) => i.id === id);
-  if (!it) return;
+async function revealGoal(id) {
+  if (!(state.goals || []).some((goal) => goal.id === id)) return;
+  activeMainView = "list";
+  if (!state.expandedIds.includes(id)) state.expandedIds.push(id);
+  if (compact) await expandWindow();
+  save();
+  render();
+  requestAnimationFrame(() => {
+    const card = [...app.querySelectorAll(".goal-row")]
+      .find((element) => element.dataset.id === id);
+    card?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    card?.querySelector('.todo-main[data-act="expand"]')?.focus({ preventScroll: true });
+  });
+}
+
+function openOverviewTodaySheet() {
+  const actions = getOverviewTodayActions();
+  const returnFocus = document.activeElement;
+  const overlay = document.createElement("div");
+  overlay.className = "overlay overview-sheet-overlay";
+  overlay.innerHTML = `<section class="dialog overview-sheet-dialog" role="dialog" aria-modal="true" aria-labelledby="today-sheet-title">
+    <div class="dialog-head"><div><h2 id="today-sheet-title">今日行动</h2><p>${actions.length ? `共 ${actions.length} 项，点击正文查看完整详情` : "今天没有待完成事项"}</p></div><button class="icon-btn" data-sheet-close aria-label="关闭">${ICONS.close}</button></div>
+    ${actions.length ? `<ul class="overview-action-list sheet-action-list">${actions.map(overviewActionRowHtml).join("")}</ul>` : ""}
+  </section>`;
+  document.body.appendChild(overlay);
+  const close = (restoreFocus = true) => {
+    overlay.remove();
+    if (restoreFocus) returnFocus?.focus?.({ preventScroll: true });
+  };
+  overlay.addEventListener("click", async (event) => {
+    if (event.target === overlay || event.target.closest("[data-sheet-close]")) return close();
+    const target = event.target.closest("[data-act]");
+    if (!target) return;
+    const { act, id, routineId } = target.dataset;
+    if (act === "toggle" || act === "goal-routine-toggle") {
+      if (act === "toggle") toggleTodo(id);
+      else toggleGoalRoutine(id, routineId);
+      const refreshedActions = getOverviewTodayActions();
+      const list = overlay.querySelector(".sheet-action-list");
+      if (list) {
+        list.innerHTML = refreshedActions.length
+          ? refreshedActions.map(overviewActionRowHtml).join("")
+          : '<li class="sheet-empty-action">今天的行动已经全部处理完毕</li>';
+      }
+      const summary = overlay.querySelector(".dialog-head p");
+      if (summary) summary.textContent = refreshedActions.length
+        ? `共 ${refreshedActions.length} 项，点击正文查看完整详情`
+        : "今天没有待完成事项";
+      const restored = [...overlay.querySelectorAll(`[data-act="${act}"]`)]
+        .find((button) => button.dataset.id === id && (button.dataset.routineId || "") === (routineId || ""));
+      restored?.focus({ preventScroll: true });
+      return;
+    }
+    close(false);
+    if (act === "todo-reveal") await revealTodo(id);
+    else if (act === "goal-reveal") await revealGoal(id);
+  });
+  overlay.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") close();
+    else trapOverlayFocus(overlay, event);
+  });
+  overlay.querySelector("[data-sheet-close]")?.focus();
+}
+
+function openHorizonBucket(bucketKey) {
+  const allEntries = buildFutureHorizonEntries(state.items, state.goals || []);
+  const buckets = bucketFutureHorizonEntries(allEntries);
+  const entries = buckets[bucketKey] || [];
+  const labels = { within30Days: "30 天内", within90Days: "31–90 天", beyond90Days: "90 天后" };
+  const returnFocus = document.activeElement;
+  const overlay = document.createElement("div");
+  overlay.className = "overlay overview-sheet-overlay";
+  overlay.innerHTML = `<section class="dialog overview-sheet-dialog" role="dialog" aria-modal="true" aria-labelledby="horizon-sheet-title">
+    <div class="dialog-head"><div><h2 id="horizon-sheet-title">${labels[bucketKey] || "未来节点"}</h2><p>${entries.length} 个节点，已按日期由近到远排列</p></div><button class="icon-btn" data-sheet-close aria-label="关闭">${ICONS.close}</button></div>
+    <div class="horizon-sheet-list">${entries.map((entry) => `<button class="horizon-sheet-row ${entry.kind}" data-sheet-kind="${esc(entry.kind)}" data-sheet-id="${esc(entry.id)}">
+      <span class="horizon-sheet-icon">${entry.kind === "goal" ? ICONS.target : ICONS.calendar}</span>
+      <span><strong>${esc(entry.title)}</strong><small><time datetime="${esc(entry.dateKey)}">${esc(shortDateLabel(entry.dateKey))}</time> · ${esc(compactRelativeLabel(entry.dateKey))}</small></span>${ICONS.arrow}
+    </button>`).join("")}</div>
+  </section>`;
+  document.body.appendChild(overlay);
+  const close = (restoreFocus = true) => {
+    overlay.remove();
+    if (restoreFocus) returnFocus?.focus?.({ preventScroll: true });
+  };
+  overlay.addEventListener("click", async (event) => {
+    if (event.target === overlay || event.target.closest("[data-sheet-close]")) return close();
+    const row = event.target.closest("[data-sheet-kind]");
+    if (!row) return;
+    const { sheetKind, sheetId } = row.dataset;
+    close(false);
+    if (sheetKind === "goal") await revealGoal(sheetId);
+    else await revealTodo(sheetId);
+  });
+  overlay.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") close();
+    else trapOverlayFocus(overlay, event);
+  });
+  overlay.querySelector("[data-sheet-close]")?.focus();
+}
+
+function toggleTodayActions() {
+  const dateKey = toDateKey();
+  state.settings.todayActionsCollapsedDate =
+    state.settings.todayActionsCollapsedDate === dateKey ? "" : dateKey;
+  save();
+  render();
+}
+
+async function revealTodayActions() {
+  state.settings.todayActionsCollapsedDate = "";
+  if (compact) await expandWindow();
+  save();
+  render();
+  requestAnimationFrame(() => {
+    const board = app.querySelector(".today-actions-board");
+    board?.scrollIntoView({ behavior: "smooth", block: "start" });
+    board?.querySelector(".today-actions-head")?.focus({ preventScroll: true });
+  });
+}
+
+function deleteGoal(id) {
+  const goal = (state.goals || []).find((entry) => entry.id === id);
+  if (!goal) return;
+  const returnFocus = document.activeElement;
   const overlay = document.createElement("div");
   overlay.className = "overlay";
-  overlay.innerHTML = `<div class="settings" style="margin-top:40px;gap:12px">
-    <h2>${DAY_TITLE[day]}待办详情</h2>
-    <div><div style="font-size:11px;color:var(--text-secondary);margin-bottom:5px">标题</div>
-    <div class="composer sm"><input id="de-title" value="${esc(it.title)}"/></div></div>
-    <div><div style="font-size:11px;color:var(--text-secondary);margin-bottom:5px">描述</div>
-    <div class="memo"><textarea id="de-detail" style="border-top:none">${esc(it.detail)}</textarea></div></div>
-    <div class="set-row"><button class="link-btn" data-de="cancel">取消</button>
-    <button class="link-btn" style="color:var(--accent);font-weight:600" data-de="save">保存详情</button></div>
-  </div>`;
+  overlay.innerHTML = `<section class="dialog confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-goal-title" aria-describedby="confirm-goal-copy">
+    <div class="confirm-icon">${ICONS.trash}</div>
+    <h2 id="confirm-goal-title">删除“${esc(goal.title)}”？</h2>
+    <p id="confirm-goal-copy">重复行动和全部历史完成记录都会一并删除，此操作无法撤销。</p>
+    <div class="dialog-actions"><button class="secondary-btn" data-confirm-goal="cancel">取消</button><button class="danger-btn" data-confirm-goal="delete">删除目标</button></div>
+  </section>`;
   document.body.appendChild(overlay);
-  overlay.addEventListener("click", (e) => {
-    if (e.target === overlay) overlay.remove();
-    const b = e.target.closest("[data-de]");
-    if (!b) return;
-    if (b.dataset.de === "cancel") overlay.remove();
-    else {
-      updateItem(id, day, overlay.querySelector("#de-title").value, overlay.querySelector("#de-detail").value);
-      overlay.remove();
-      render();
+  const close = () => {
+    overlay.remove();
+    returnFocus?.focus?.({ preventScroll: true });
+  };
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay || event.target.closest('[data-confirm-goal="cancel"]')) return close();
+    if (!event.target.closest('[data-confirm-goal="delete"]')) return;
+    if (!persistMutation(() => {
+      const previousGoals = state.goals;
+      const previousExpandedIds = state.expandedIds;
+      state.goals = (state.goals || []).filter((entry) => entry.id !== id);
+      state.expandedIds = state.expandedIds.filter((value) => value !== id);
+      statusAnnouncement = `${goal.title}已删除`;
+      return () => {
+        state.goals = previousGoals;
+        state.expandedIds = previousExpandedIds;
+      };
+    })) {
+      showPersistenceError(overlay);
+      return;
     }
+    overlay.remove();
+    render();
   });
-  overlay.querySelector("#de-title")?.focus();
+  overlay.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") close();
+  });
+  overlay.querySelector('[data-confirm-goal="cancel"]')?.focus();
 }
 
-/* ---------------- 设置面板 ---------------- */
+app.addEventListener("click", async (event) => {
+  const link = event.target.closest("a[data-link]");
+  if (link) {
+    event.preventDefault();
+    openExternal(link.dataset.link);
+    return;
+  }
+  const target = event.target.closest("[data-act]");
+  if (!target) return;
+  const id = target.dataset.id;
+  switch (target.dataset.act) {
+    case "toggle": toggleTodo(id); break;
+    case "expand": toggleExpanded(id); break;
+    case "subtask-toggle": toggleSubtask(id, target.dataset.subtaskId); break;
+    case "goal-routine-toggle": toggleGoalRoutine(id, target.dataset.routineId); break;
+    case "todo-reveal": await revealTodo(id); break;
+    case "goal-reveal": await revealGoal(id); break;
+    case "horizon-reveal": target.dataset.kind === "goal" ? await revealGoal(id) : await revealTodo(id); break;
+    case "open-horizon-bucket": openHorizonBucket(target.dataset.bucket); break;
+    case "open-today-sheet": openOverviewTodaySheet(); break;
+    case "view-overview": switchMainView("overview"); break;
+    case "view-list": switchMainView("list"); break;
+    case "today-actions-toggle": toggleTodayActions(); break;
+    case "today-actions-reveal": await revealTodayActions(); break;
+    case "goal-pause": toggleGoalPause(id); break;
+    case "goal-complete": toggleGoalComplete(id); break;
+    case "goal-delete": deleteGoal(id); break;
+    case "goal-edit": openGoalEditor(id); break;
+    case "edit": openEditor(id); break;
+    case "delete": deleteTodo(id); break;
+    case "new-menu": openCreateMenu(); break;
+    case "settings": openSettings(); break;
+    case "completed-overflow": showAllCompleted = !showAllCompleted; render(); break;
+    case "grow": if (await expandWindow()) render(); break;
+  }
+});
+
+const WEEKDAY_OPTIONS = [
+  { value: 1, label: "一" },
+  { value: 2, label: "二" },
+  { value: 3, label: "三" },
+  { value: 4, label: "四" },
+  { value: 5, label: "五" },
+  { value: 6, label: "六" },
+  { value: 0, label: "日" },
+];
+
+function openCreateMenu() {
+  const returnFocus = document.activeElement;
+  const overlay = document.createElement("div");
+  overlay.className = "overlay create-overlay";
+  overlay.innerHTML = `<section class="dialog create-dialog" role="dialog" aria-modal="true" aria-labelledby="create-title">
+    <div class="dialog-head"><div><h2 id="create-title">新建</h2><p>选择最适合这件事的类型</p></div><button class="icon-btn" data-create="close" aria-label="关闭">${ICONS.close}</button></div>
+    <div class="create-options">
+      <button class="create-option todo-option" data-create="todo">
+        <span class="create-option-icon">${ICONS.check}</span>
+        <span><strong>待办或重要节点</strong><small>今天要做的事，或有日期的考试、比赛与截止</small></span>
+        ${ICONS.arrow}
+      </button>
+      <button class="create-option goal-option" data-create="goal">
+        <span class="create-option-icon">${ICONS.target}</span>
+        <span><strong>阶段目标</strong><small>目标日期与每天重复的行动计划</small></span>
+        ${ICONS.arrow}
+      </button>
+    </div>
+  </section>`;
+  document.body.appendChild(overlay);
+
+  const close = (restoreFocus = true) => {
+    overlay.remove();
+    if (restoreFocus) returnFocus?.focus?.({ preventScroll: true });
+  };
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay || event.target.closest('[data-create="close"]')) return close();
+    const choice = event.target.closest("[data-create]")?.dataset.create;
+    if (choice === "todo") {
+      close(false);
+      openEditor();
+    } else if (choice === "goal") {
+      close(false);
+      openGoalEditor();
+    }
+  });
+  overlay.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") close();
+  });
+  overlay.querySelector('[data-create="todo"]')?.focus();
+}
+
+function routineEditorRowHtml(routine = {}) {
+  const routineId = routine.id || uid();
+  const timeErrorId = `routine-time-error-${uid()}`;
+  const timeMode = timeModeFor(routine.time, routine.endTime);
+  const schedule = ["daily", "weekdays", "custom"].includes(routine.schedule)
+    ? routine.schedule
+    : "daily";
+  const selectedDays = new Set(
+    schedule === "custom" && Array.isArray(routine.weekdays) && routine.weekdays.length
+      ? routine.weekdays
+      : [1, 2, 3, 4, 5]
+  );
+  return `<div class="routine-editor-row" data-routine-row data-time-scope data-routine-id="${esc(routineId)}">
+    <div class="routine-title-row">
+      <span class="routine-accent" aria-hidden="true"></span>
+      <input class="routine-title-input" maxlength="120" value="${esc(routine.title || "")}" placeholder="例如：背单词 30 分钟" aria-label="重复行动名称" />
+      <button class="routine-remove" data-routine-remove aria-label="移除重复行动">${ICONS.close}</button>
+    </div>
+    <div class="routine-config-row">
+      <label><span>重复</span><select class="routine-schedule" aria-label="重复频率">
+        <option value="daily" ${schedule === "daily" ? "selected" : ""}>每天</option>
+        <option value="weekdays" ${schedule === "weekdays" ? "selected" : ""}>工作日</option>
+        <option value="custom" ${schedule === "custom" ? "selected" : ""}>自定义</option>
+      </select></label>
+      <label><span>时间安排</span><select class="routine-time-mode" data-time-mode aria-label="时间安排">${timeModeOptions(timeMode)}</select></label>
+    </div>
+    <div class="routine-time-fields time-fields ${timeMode === "none" ? "hidden" : ""} ${timeMode === "point" ? "point" : ""}" data-time-fields>
+      <label><span data-time-start-label>${timeMode === "range" ? "开始时间" : "时间点"}</span><input class="routine-time" data-time-start type="time" value="${esc(routine.time || "")}" ${timeMode === "none" ? "disabled" : ""} aria-describedby="${esc(timeErrorId)}" /></label>
+      <label class="${timeMode === "range" ? "" : "hidden"}" data-time-end-field><span>结束时间</span><input class="routine-end-time" data-time-end type="time" value="${esc(routine.endTime || "")}" ${timeMode === "range" ? "" : "disabled"} aria-describedby="${esc(timeErrorId)}" /></label>
+    </div>
+    <p id="${esc(timeErrorId)}" class="time-editor-error hidden" data-time-error role="alert"></p>
+    <div class="weekday-picker ${schedule === "custom" ? "" : "hidden"}" data-weekday-picker aria-label="选择重复星期">
+      ${WEEKDAY_OPTIONS.map((day) => `<button type="button" class="${selectedDays.has(day.value) ? "on" : ""}" data-weekday="${day.value}" aria-pressed="${selectedDays.has(day.value)}">${day.label}</button>`).join("")}
+    </div>
+  </div>`;
+}
+
+function removeRoutineReference(goal, collectionName, dateKey, routineId) {
+  const collection = goal[collectionName];
+  if (!collection?.[dateKey]) return;
+  delete collection[dateKey][routineId];
+  if (!Object.keys(collection[dateKey]).length) delete collection[dateKey];
+}
+
+function routineScheduleSignature(routine) {
+  const weekdays = routine.schedule === "custom"
+    ? [...(routine.weekdays || [])].sort((a, b) => a - b).join(",")
+    : "";
+  return `${routine.schedule}:${weekdays}`;
+}
+
+function mergeGoalRoutines(goal, drafts) {
+  const today = toDateKey();
+  const yesterday = addDays(today, -1);
+  const original = goal.routines || [];
+  const archived = original.filter((routine) => routine.endDate && routine.endDate < today);
+  const current = original.filter((routine) => !routine.endDate || routine.endDate >= today);
+  const draftById = new Map(drafts.map((routine) => [routine.id, routine]));
+  const merged = [...archived];
+
+  current.forEach((routine) => {
+    const draft = draftById.get(routine.id);
+    const startDate = routine.startDate || goal.startDate || today;
+    if (!draft) {
+      if (startDate < today) merged.push({ ...routine, endDate: yesterday });
+      else {
+        removeRoutineReference(goal, "records", today, routine.id);
+        removeRoutineReference(goal, "notifiedRecords", today, routine.id);
+      }
+      return;
+    }
+
+    draftById.delete(routine.id);
+    const scheduleChanged = routineScheduleSignature(routine) !== routineScheduleSignature(draft);
+    const startTimeChanged = routine.time !== draft.time;
+    const timeRangeChanged = startTimeChanged || (routine.endTime || "") !== (draft.endTime || "");
+    if ((scheduleChanged || timeRangeChanged) && startDate < today) {
+      merged.push({ ...routine, endDate: yesterday });
+      const replacement = { ...draft, id: uid(), startDate: today, endDate: "" };
+      const wasCompleted = goal.records?.[today]?.[routine.id] === true;
+      const wasNotified = goal.notifiedRecords?.[today]?.[routine.id] === true;
+      removeRoutineReference(goal, "records", today, routine.id);
+      removeRoutineReference(goal, "notifiedRecords", today, routine.id);
+      if (wasCompleted && routineOccursOnDate(replacement, today)) {
+        goal.records ||= {};
+        goal.records[today] ||= {};
+        goal.records[today][replacement.id] = true;
+      }
+      if (wasNotified && !startTimeChanged && routineOccursOnDate(replacement, today)) {
+        goal.notifiedRecords ||= {};
+        goal.notifiedRecords[today] ||= {};
+        goal.notifiedRecords[today][replacement.id] = true;
+      }
+      merged.push(replacement);
+    } else {
+      if (startTimeChanged) {
+        removeRoutineReference(goal, "notifiedRecords", today, routine.id);
+      }
+      if (scheduleChanged) {
+        if (!routineOccursOnDate(draft, today)) {
+          removeRoutineReference(goal, "records", today, routine.id);
+        }
+      }
+      merged.push({ ...routine, ...draft, startDate, endDate: "" });
+    }
+  });
+
+  draftById.forEach((draft) => {
+    merged.push({ ...draft, startDate: today, endDate: "" });
+  });
+  return merged;
+}
+
+function openGoalEditor(id = null, options = {}) {
+  let goal = (state.goals || []).find((entry) => entry.id === id);
+  const values = goal || {
+    title: "",
+    detail: "",
+    targetDate: addDays(toDateKey(), 90),
+    startDate: toDateKey(),
+    routines: [],
+  };
+  const today = toDateKey();
+  const editableRoutines = (values.routines || []).filter((routine) => !routine.endDate || routine.endDate >= today);
+  const returnFocus = document.activeElement;
+  const overlay = document.createElement("div");
+  overlay.className = "overlay";
+  overlay.innerHTML = `<section class="dialog goal-editor-dialog" role="dialog" aria-modal="true" aria-labelledby="goal-editor-title">
+    <div class="dialog-head"><div><h2 id="goal-editor-title">${options.reopenOnSave ? "延长并重新开启" : goal ? "编辑阶段目标" : "新建阶段目标"}</h2><p>未来计划不会堆满列表，只显示今天要做的行动</p></div><button class="icon-btn" data-goal-dialog="close" aria-label="关闭">${ICONS.close}</button></div>
+    <label class="field"><span>目标名称</span><input id="goal-title" maxlength="120" value="${esc(values.title)}" placeholder="例如：六级备考" required /></label>
+    <label class="field"><span>目标日期</span><input id="goal-target-date" type="date" min="${esc(options.reopenOnSave ? today : values.startDate || today)}" value="${esc(values.targetDate)}" required /></label>
+    <div class="routine-editor-block">
+      <div class="routine-editor-head"><div><strong>重复行动</strong><span>每天只生成当天需要执行的内容</span></div><button data-routine-add>${ICONS.plus} 添加行动</button></div>
+      <div id="routine-editor-list" class="routine-editor-list">
+        ${editableRoutines.length
+          ? editableRoutines.map(routineEditorRowHtml).join("")
+          : '<div class="routine-editor-empty"><span>还没有行动计划</span><small>例如每天背单词、工作日刷题</small></div>'}
+      </div>
+    </div>
+    <label class="field"><span>目标说明（可选）</span><textarea id="goal-detail" rows="3" placeholder="补充资料链接、备考范围或阶段说明…">${esc(values.detail)}</textarea></label>
+    <div class="dialog-actions goal-dialog-actions"><button class="secondary-btn" data-goal-dialog="close">取消</button><button class="primary-btn" data-goal-dialog="save">${options.reopenOnSave ? "延长并重新开启" : goal ? "保存修改" : "创建目标"}</button></div>
+  </section>`;
+  document.body.appendChild(overlay);
+
+  const close = () => {
+    overlay.remove();
+    returnFocus?.focus?.({ preventScroll: true });
+  };
+  const routineList = overlay.querySelector("#routine-editor-list");
+  const addRoutine = () => {
+    routineList.querySelector(".routine-editor-empty")?.remove();
+    routineList.insertAdjacentHTML("beforeend", routineEditorRowHtml());
+    routineList.querySelector(".routine-editor-row:last-child .routine-title-input")?.focus();
+  };
+
+  overlay.addEventListener("change", (event) => {
+    const row = event.target.closest("[data-routine-row]");
+    if (event.target.matches(".routine-schedule")) {
+      const picker = row.querySelector("[data-weekday-picker]");
+      picker.classList.toggle("hidden", event.target.value !== "custom");
+    } else if (event.target.matches("[data-time-mode]")) {
+      syncTimeEditor(row);
+    }
+  });
+  overlay.addEventListener("input", (event) => {
+    if (event.target.matches("[data-time-start], [data-time-end]")) {
+      const row = event.target.closest("[data-time-scope]");
+      row.querySelector("[data-time-error]")?.classList.add("hidden");
+      row.querySelectorAll("[data-time-start], [data-time-end]").forEach((input) => {
+        input.removeAttribute("aria-invalid");
+      });
+    }
+  });
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay || event.target.closest('[data-goal-dialog="close"]')) return close();
+    if (event.target.closest("[data-routine-add]")) return addRoutine();
+    const removeButton = event.target.closest("[data-routine-remove]");
+    if (removeButton) {
+      removeButton.closest("[data-routine-row]")?.remove();
+      if (!routineList.querySelector("[data-routine-row]")) {
+        routineList.innerHTML = '<div class="routine-editor-empty"><span>还没有行动计划</span><small>例如每天背单词、工作日刷题</small></div>';
+      }
+      return;
+    }
+    const weekday = event.target.closest("[data-weekday]");
+    if (weekday) {
+      const selected = !weekday.classList.contains("on");
+      weekday.classList.toggle("on", selected);
+      weekday.setAttribute("aria-pressed", String(selected));
+      return;
+    }
+    if (!event.target.closest('[data-goal-dialog="save"]')) return;
+
+    const title = overlay.querySelector("#goal-title").value.trim();
+    const targetDate = overlay.querySelector("#goal-target-date").value;
+    const minimumTargetDate = options.reopenOnSave ? today : values.startDate || today;
+    if (!title || !fromDateKey(targetDate) || targetDate < minimumTargetDate) {
+      overlay.querySelector(!title ? "#goal-title" : "#goal-target-date").focus();
+      overlay.querySelector(".dialog")?.classList.add("shake");
+      setTimeout(() => overlay.querySelector(".dialog")?.classList.remove("shake"), 300);
+      return;
+    }
+
+    const routineRows = [...overlay.querySelectorAll("[data-routine-row]")]
+      .filter((row) => row.querySelector(".routine-title-input").value.trim());
+    const invalidCustom = routineRows.find((row) =>
+      row.querySelector(".routine-schedule").value === "custom" &&
+      !row.querySelector("[data-weekday].on")
+    );
+    if (invalidCustom) {
+      invalidCustom.querySelector("[data-weekday]")?.focus();
+      invalidCustom.classList.add("shake");
+      setTimeout(() => invalidCustom.classList.remove("shake"), 300);
+      return;
+    }
+    const routineTimes = routineRows.map((row) => ({ row, result: readTimeEditor(row) }));
+    const invalidTime = routineTimes.find(({ result }) => result.message);
+    if (invalidTime) {
+      showTimeEditorError(invalidTime.row, invalidTime.result);
+      return;
+    }
+    const routines = routineTimes.map(({ row, result }) => ({
+      id: row.dataset.routineId || uid(),
+      title: row.querySelector(".routine-title-input").value.trim(),
+      time: result.startTime,
+      endTime: result.endTime,
+      schedule: row.querySelector(".routine-schedule").value,
+      weekdays: [...row.querySelectorAll("[data-weekday].on")].map((button) => Number(button.dataset.weekday)),
+    }));
+    const next = {
+      title,
+      targetDate,
+      detail: overlay.querySelector("#goal-detail").value.trim(),
+    };
+    const previousState = cloneState();
+    if (goal) {
+      const mergedRoutines = mergeGoalRoutines(goal, routines);
+      Object.assign(goal, next, { routines: mergedRoutines });
+      if (options.reopenOnSave) {
+        goal.status = "active";
+        goal.completedAt = null;
+        closeOpenPausePeriod(goal, today);
+        statusAnnouncement = `${goal.title}已重新开启`;
+      }
+      if (!state.expandedIds.includes(goal.id)) state.expandedIds.push(goal.id);
+    } else {
+      const newGoal = {
+        id: uid(),
+        ...next,
+        startDate: today,
+        status: "active",
+        completedAt: null,
+        routines: routines.map((routine) => ({ ...routine, startDate: today, endDate: "" })),
+        records: {},
+        notifiedRecords: {},
+        pausePeriods: [],
+        createdAt: Date.now(),
+      };
+      state.goals ||= [];
+      state.goals.push(newGoal);
+      state.expandedIds.push(newGoal.id);
+    }
+    if (!save()) {
+      state = previousState;
+      goal = id ? state.goals.find((entry) => entry.id === id) : null;
+      showPersistenceError(overlay);
+      return;
+    }
+    overlay.remove();
+    render();
+  });
+  overlay.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") close();
+    if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+      event.preventDefault();
+      overlay.querySelector('[data-goal-dialog="save"]')?.click();
+    } else if (event.key === "Enter" && event.target.matches(".routine-title-input")) {
+      event.preventDefault();
+      addRoutine();
+    }
+  });
+  overlay.querySelector("#goal-title")?.focus();
+}
+
+function subtaskEditorRowHtml(subtask = {}) {
+  const subtaskId = subtask.id || uid();
+  return `<div class="subtask-editor-row" data-subtask-row data-subtask-id="${esc(subtaskId)}" data-completed="${!!subtask.completed}">
+    <span class="subtask-editor-dot" aria-hidden="true"></span>
+    <input class="subtask-editor-input" maxlength="120" value="${esc(subtask.title || "")}" placeholder="输入子待办" aria-label="子待办标题" />
+    <button class="subtask-remove" data-subtask-remove aria-label="移除子待办">${ICONS.close}</button>
+  </div>`;
+}
+
+function openEditor(id = null) {
+  let item = state.items.find((todo) => todo.id === id);
+  const values = item || {
+    title: "",
+    detail: "",
+    subtasks: [],
+    dueDate: toDateKey(),
+    dueTime: "",
+    dueEndTime: "",
+  };
+  const todoTimeMode = timeModeFor(values.dueTime, values.dueEndTime);
+  const returnFocus = document.activeElement;
+  const overlay = document.createElement("div");
+  overlay.className = "overlay";
+  overlay.innerHTML = `<section class="dialog editor-dialog" role="dialog" aria-modal="true" aria-labelledby="editor-title">
+    <div class="dialog-head"><div><h2 id="editor-title">${item ? "编辑待办" : "新建待办"}</h2><p>安排日期与时间，列表会自动排序</p></div><button class="icon-btn" data-dialog="close" aria-label="关闭">${ICONS.close}</button></div>
+    <label class="field"><span>待办标题</span><input id="edit-title" maxlength="120" value="${esc(values.title)}" placeholder="要完成什么？" required /></label>
+    <div class="todo-time-editor" data-time-scope>
+      <div class="field-grid">
+      <label class="field"><span>日期</span><input id="edit-date" type="date" value="${esc(values.dueDate)}" required /></label>
+      <label class="field"><span>时间安排</span><select id="edit-time-mode" data-time-mode>${timeModeOptions(todoTimeMode)}</select></label>
+      </div>
+      <div class="time-fields field-grid ${todoTimeMode === "none" ? "hidden" : ""} ${todoTimeMode === "point" ? "point" : ""}" data-time-fields>
+        <label class="field"><span data-time-start-label>${todoTimeMode === "range" ? "开始时间" : "时间点"}</span><input id="edit-time" data-time-start type="time" value="${esc(values.dueTime || "")}" ${todoTimeMode === "none" ? "disabled" : ""} aria-describedby="todo-time-error" /></label>
+        <label class="field ${todoTimeMode === "range" ? "" : "hidden"}" data-time-end-field><span>结束时间</span><input id="edit-end-time" data-time-end type="time" value="${esc(values.dueEndTime || "")}" ${todoTimeMode === "range" ? "" : "disabled"} aria-describedby="todo-time-error" /></label>
+      </div>
+      <p id="todo-time-error" class="time-editor-error hidden" data-time-error role="alert"></p>
+    </div>
+    <label class="field"><span>更多细节（可选）</span><textarea id="edit-detail" rows="5" placeholder="补充地点、链接、步骤或备注…">${esc(values.detail)}</textarea></label>
+    <div class="subtask-editor-block">
+      <div class="subtask-editor-head"><div><strong>子待办（可选）</strong><span>将任务拆分成可单独完成的小步骤</span></div><button data-subtask-add>${ICONS.plus} 添加</button></div>
+      <div id="subtask-editor-list" class="subtask-editor-list">
+        ${(values.subtasks || []).length
+          ? values.subtasks.map(subtaskEditorRowHtml).join("")
+          : '<p class="subtask-editor-empty">暂未添加子待办</p>'}
+      </div>
+    </div>
+    <div class="dialog-actions editor-dialog-actions"><button class="secondary-btn" data-dialog="close">取消</button><button class="primary-btn" data-dialog="save">${item ? "保存修改" : "创建待办"}</button></div>
+  </section>`;
+  document.body.appendChild(overlay);
+
+  const close = () => {
+    overlay.remove();
+    returnFocus?.focus?.({ preventScroll: true });
+  };
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay || event.target.closest('[data-dialog="close"]')) return close();
+    if (event.target.closest("[data-subtask-add]")) {
+      const list = overlay.querySelector("#subtask-editor-list");
+      list.querySelector(".subtask-editor-empty")?.remove();
+      list.insertAdjacentHTML("beforeend", subtaskEditorRowHtml());
+      list.querySelector(".subtask-editor-row:last-child input")?.focus();
+      return;
+    }
+    const removeSubtask = event.target.closest("[data-subtask-remove]");
+    if (removeSubtask) {
+      const list = overlay.querySelector("#subtask-editor-list");
+      removeSubtask.closest("[data-subtask-row]")?.remove();
+      if (!list.querySelector("[data-subtask-row]")) {
+        list.innerHTML = '<p class="subtask-editor-empty">暂未添加子待办</p>';
+      }
+      return;
+    }
+    if (!event.target.closest('[data-dialog="save"]')) return;
+    const title = overlay.querySelector("#edit-title").value.trim();
+    const dueDate = overlay.querySelector("#edit-date").value;
+    if (!title || !dueDate) {
+      overlay.querySelector(!title ? "#edit-title" : "#edit-date").focus();
+      overlay.querySelector(".dialog")?.classList.add("shake");
+      setTimeout(() => overlay.querySelector(".dialog")?.classList.remove("shake"), 300);
+      return;
+    }
+    const timeResult = readTimeEditor(overlay.querySelector("[data-time-scope]"));
+    if (timeResult.message) {
+      showTimeEditorError(overlay.querySelector("[data-time-scope]"), timeResult);
+      return;
+    }
+    const next = {
+      title,
+      dueDate,
+      dueTime: timeResult.startTime,
+      dueEndTime: timeResult.endTime,
+      detail: overlay.querySelector("#edit-detail").value.trim(),
+      subtasks: [...overlay.querySelectorAll("[data-subtask-row]")]
+        .map((row) => ({
+          id: row.dataset.subtaskId || uid(),
+          title: row.querySelector(".subtask-editor-input").value.trim(),
+          completed: row.dataset.completed === "true",
+        }))
+        .filter((subtask) => subtask.title),
+    };
+    const previousState = cloneState();
+    let persisted = false;
+    if (item) {
+      const reminderTriggerChanged = item.dueDate !== next.dueDate || item.dueTime !== next.dueTime;
+      Object.assign(item, next, { notified: reminderTriggerChanged ? false : item.notified });
+      if (item.completed && item.subtasks.some((subtask) => !subtask.completed)) {
+        item.completed = false;
+        item.completedAt = null;
+      }
+      if (!state.expandedIds.includes(item.id)) state.expandedIds.push(item.id);
+      persisted = save();
+    } else {
+      persisted = addTodo(next);
+    }
+    if (!persisted) {
+      state = previousState;
+      item = id ? state.items.find((todo) => todo.id === id) : null;
+      showPersistenceError(overlay);
+      return;
+    }
+    close();
+    render();
+  });
+  overlay.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") close();
+    if (event.key === "Enter" && event.target.matches(".subtask-editor-input")) {
+      event.preventDefault();
+      overlay.querySelector("[data-subtask-add]").click();
+      return;
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+      event.preventDefault();
+      overlay.querySelector('[data-dialog="save"]').click();
+    }
+  });
+  overlay.addEventListener("input", (event) => {
+    if (event.target.matches("[data-time-start], [data-time-end]")) {
+      const editor = event.target.closest("[data-time-scope]");
+      editor.querySelector("[data-time-error]")?.classList.add("hidden");
+      editor.querySelectorAll("[data-time-start], [data-time-end]").forEach((input) => {
+        input.removeAttribute("aria-invalid");
+      });
+    }
+  });
+  overlay.addEventListener("change", (event) => {
+    if (!event.target.matches("[data-time-mode]")) return;
+    const editor = event.target.closest("[data-time-scope]");
+    syncTimeEditor(editor);
+  });
+  overlay.querySelector("#edit-title")?.focus();
+}
+
+function deleteTodo(id) {
+  if (!state.items.some((item) => item.id === id)) return;
+  persistMutation(() => {
+    const previousItems = state.items;
+    const previousExpandedIds = state.expandedIds;
+    state.items = state.items.filter((item) => item.id !== id);
+    state.expandedIds = state.expandedIds.filter((value) => value !== id);
+    return () => {
+      state.items = previousItems;
+      state.expandedIds = previousExpandedIds;
+    };
+  });
+  render();
+}
+
+async function openExternal(url) {
+  try {
+    if (TAURI?.opener?.openUrl) await TAURI.opener.openUrl(url);
+    else await TAURI?.core?.invoke("plugin:opener|open_url", { url });
+  } catch (_) {
+    window.open(url, "_blank", "noopener");
+  }
+}
 
 function openSettings() {
+  const settings = state.settings;
+  let persistedOpacity = settings.opacity;
   const overlay = document.createElement("div");
   overlay.className = "overlay";
-  const s = state.settings;
-  const bgHex = s.customBg ? rgbToHex(s.customBg) : "#dceaff";
-  overlay.innerHTML = `<div class="settings">
-    <h2>小组件设置</h2>
-    <div class="set-row"><span>始终置顶</span><div class="switch ${s.alwaysOnTop ? "on" : ""}" data-s="alwaysOnTop"></div></div>
-    <div class="set-row"><span>鼠标穿透（点击落到下层）</span><div class="switch ${s.clickThrough ? "on" : ""}" data-s="clickThrough"></div></div>
-    <div class="set-row"><span>开机自启动</span><div class="switch" id="autostart-sw" data-s="autostart"></div></div>
-    <div class="set-row"><span>开启备忘录</span><div class="switch ${s.memoEnabled ? "on" : ""}" data-s="memoEnabled"></div></div>
-    <div>
-      <div style="font-size:13px;font-weight:500;margin-bottom:6px">外观</div>
-      <div class="seg-control">
-        <button class="${s.appearance === "system" ? "on" : ""}" data-ap="system">跟随系统</button>
-        <button class="${s.appearance === "light" ? "on" : ""}" data-ap="light">浅色</button>
-        <button class="${s.appearance === "dark" ? "on" : ""}" data-ap="dark">深色</button>
-      </div>
-    </div>
-    <div class="set-row"><span>背景色</span>
-      <div style="display:flex;align-items:center;gap:8px">
-        <input type="color" id="bg-color" value="${bgHex}"/>
-        <button class="link-btn" data-s="resetBg" ${s.customBg ? "" : 'style="opacity:.45"'}>恢复默认</button>
-      </div>
-    </div>
-    <div>
-      <div class="set-row"><span>透明度</span><span style="color:var(--text-secondary)">${Math.round(s.opacity * 100)}%</span></div>
-      <input type="range" id="op-range" min="0.2" max="0.95" step="0.01" value="${s.opacity}"/>
-    </div>
-    <div class="set-row" style="gap:8px">
-      <button class="data-btn" data-s="export">${ICONS.download}<span>导出备份</span></button>
-      <button class="data-btn" data-s="import">${ICONS.upload}<span>导入备份</span></button>
-    </div>
-    <div style="font-size:11px;color:var(--text-secondary);line-height:1.6">
-      💡 全局快捷键 <b>${navigator.platform.includes("Mac") ? "⌘⇧Space" : "Ctrl+Shift+Space"}</b> 可在任意应用中唤起并聚焦输入框，快速记一笔。<br>
-      ⏰ 输入「明天 15:00 开会」会自动识别日期与提醒时间。<br>
-      🖱️ 开启鼠标穿透后浮窗不再挡点击，可从<b>托盘菜单「切换鼠标穿透」</b>关回来。
-    </div>
-    <div class="set-row" style="justify-content:flex-end"><button class="link-btn" data-s="close">完成</button></div>
-  </div>`;
+  overlay.innerHTML = `<section class="dialog settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="dialog-head"><div><h2 id="settings-title">小组件设置</h2><p>常驻桌面，但尽量不打扰</p></div><button class="icon-btn" data-setting="close" aria-label="关闭">${ICONS.close}</button></div>
+    <div class="setting-row"><div><strong>始终置顶</strong><span>保持待办一直可见</span></div><button class="switch ${settings.alwaysOnTop ? "on" : ""}" data-setting="alwaysOnTop" role="switch" aria-checked="${settings.alwaysOnTop}" aria-label="始终置顶"></button></div>
+    <div class="setting-row"><div><strong>开机自启动</strong><span>登录电脑后自动显示</span></div><button id="autostart-switch" class="switch" data-setting="autostart" role="switch" aria-checked="false" aria-label="开机自启动"></button></div>
+    <div class="setting-row"><div><strong>鼠标穿透</strong><span>点击会落到下方窗口</span></div><button class="switch ${settings.clickThrough ? "on" : ""}" data-setting="clickThrough" role="switch" aria-checked="${settings.clickThrough}" aria-label="鼠标穿透"></button></div>
+    <div class="setting-block"><strong>外观</strong><div class="segmented" role="radiogroup" aria-label="外观主题">
+      <button class="${settings.appearance === "system" ? "on" : ""}" data-theme-value="system" role="radio" aria-checked="${settings.appearance === "system"}">跟随系统</button>
+      <button class="${settings.appearance === "light" ? "on" : ""}" data-theme-value="light" role="radio" aria-checked="${settings.appearance === "light"}">浅色</button>
+      <button class="${settings.appearance === "dark" ? "on" : ""}" data-theme-value="dark" role="radio" aria-checked="${settings.appearance === "dark"}">深色</button>
+    </div></div>
+    <label class="setting-block"><span class="range-label"><strong>透明度</strong><em>${Math.round(settings.opacity * 100)}%</em></span><input id="opacity-range" type="range" min="0.72" max="0.98" step="0.01" value="${settings.opacity}" /></label>
+    <div class="backup-row"><button data-setting="export">${ICONS.download}导出备份</button><button data-setting="import">${ICONS.upload}导入备份</button></div>
+    <p class="settings-tip">快捷键 <b>${navigator.platform.includes("Mac") ? "⌘⇧Space" : "Ctrl+Shift+Space"}</b> 可随时唤起。开启鼠标穿透后，可从系统托盘菜单关闭。</p>
+  </section>`;
   document.body.appendChild(overlay);
 
-  overlay.addEventListener("click", (e) => {
-    if (e.target === overlay) { overlay.remove(); return; }
-    const sw = e.target.closest("[data-s]");
-    if (sw) {
-      const key = sw.dataset.s;
-      if (key === "alwaysOnTop") { state.settings.alwaysOnTop = !state.settings.alwaysOnTop; sw.classList.toggle("on"); }
-      else if (key === "memoEnabled") {
-        state.settings.memoEnabled = !state.settings.memoEnabled;
-        if (state.settings.memoEnabled) state.memo.expanded = true;
-        sw.classList.toggle("on");
-      }
-      else if (key === "resetBg") { state.settings.customBg = null; overlay.remove(); save(); render(); openSettings(); return; }
-      else if (key === "clickThrough") {
-        state.settings.clickThrough = !state.settings.clickThrough;
-        sw.classList.toggle("on");
-        save();
-        // 开启后浮窗不再响应点击，先关闭设置面板避免被困
-        if (state.settings.clickThrough) overlay.remove();
-        applyWindowChrome();
-        return;
-      }
-      else if (key === "autostart") { toggleAutostart(sw); return; }
-      else if (key === "export") { exportBackup(); return; }
-      else if (key === "import") { importBackup(overlay); return; }
-      else if (key === "close") { overlay.remove(); }
-      save(); applyWindowChrome(); render();
+  overlay.addEventListener("click", async (event) => {
+    if (event.target === overlay || event.target.closest('[data-setting="close"]')) return overlay.remove();
+    const theme = event.target.closest("[data-theme-value]");
+    if (theme) {
+      const previousAppearance = settings.appearance;
+      settings.appearance = theme.dataset.themeValue;
+      if (!save()) {
+        settings.appearance = previousAppearance;
+        showPersistenceError(overlay);
+      } else clearPersistenceError(overlay);
+      overlay.querySelectorAll("[data-theme-value]").forEach((button) => {
+        const selected = button.dataset.themeValue === settings.appearance;
+        button.classList.toggle("on", selected);
+        button.setAttribute("aria-checked", String(selected));
+      });
+      applyAppearance(); return;
     }
-    const ap = e.target.closest("[data-ap]");
-    if (ap) {
-      state.settings.appearance = ap.dataset.ap;
-      overlay.querySelectorAll("[data-ap]").forEach((b) => b.classList.toggle("on", b === ap));
-      save(); applyWindowChrome();
+    const target = event.target.closest("[data-setting]");
+    if (!target) return;
+    const key = target.dataset.setting;
+    if (key === "alwaysOnTop") {
+      const previousValue = settings.alwaysOnTop;
+      settings.alwaysOnTop = !settings.alwaysOnTop;
+      if (!save()) {
+        settings.alwaysOnTop = previousValue;
+        showPersistenceError(overlay);
+      } else clearPersistenceError(overlay);
+      target.classList.toggle("on", settings.alwaysOnTop);
+      target.setAttribute("aria-checked", String(settings.alwaysOnTop));
+      applyAppearance();
+    } else if (key === "clickThrough") {
+      const previousValue = settings.clickThrough;
+      settings.clickThrough = !settings.clickThrough;
+      const persisted = save();
+      if (!persisted) {
+        settings.clickThrough = previousValue;
+        showPersistenceError(overlay);
+      } else clearPersistenceError(overlay);
+      target.classList.toggle("on", settings.clickThrough);
+      target.setAttribute("aria-checked", String(settings.clickThrough));
+      if (persisted && settings.clickThrough) overlay.remove();
+      applyAppearance();
+    } else if (key === "autostart") {
+      await toggleAutostart(target, overlay);
+    } else if (key === "export") {
+      await exportBackup();
+    } else if (key === "import") {
+      await importBackup(overlay);
     }
   });
-  overlay.querySelector("#op-range").addEventListener("input", (e) => {
-    state.settings.opacity = parseFloat(e.target.value);
-    e.target.previousElementSibling.querySelector("span:last-child").textContent = Math.round(state.settings.opacity * 100) + "%";
-    applyWindowChrome(); save();
+  overlay.querySelector("#opacity-range")?.addEventListener("input", (event) => {
+    settings.opacity = Number(event.target.value);
+    overlay.querySelector(".range-label em").textContent = `${Math.round(settings.opacity * 100)}%`;
+    applyAppearance();
   });
-  overlay.querySelector("#bg-color").addEventListener("input", (e) => {
-    state.settings.customBg = hexToRgb(e.target.value);
-    applyWindowChrome(); save();
+  overlay.querySelector("#opacity-range")?.addEventListener("change", (event) => {
+    if (save()) {
+      persistedOpacity = settings.opacity;
+      clearPersistenceError(overlay);
+      return;
+    }
+    settings.opacity = persistedOpacity;
+    event.target.value = String(persistedOpacity);
+    overlay.querySelector(".range-label em").textContent = `${Math.round(persistedOpacity * 100)}%`;
+    applyAppearance();
+    showPersistenceError(overlay);
   });
-  // 异步同步开机自启动开关的真实状态
   (async () => {
     try {
-      const on = await TAURI?.autostart?.isEnabled();
-      overlay.querySelector("#autostart-sw")?.classList.toggle("on", !!on);
-    } catch (e) {}
+      const enabled = await TAURI?.autostart?.isEnabled();
+      const autostartSwitch = overlay.querySelector("#autostart-switch");
+      autostartSwitch?.classList.toggle("on", !!enabled);
+      autostartSwitch?.setAttribute("aria-checked", String(!!enabled));
+    } catch (_) {}
   })();
+
+  overlay.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") overlay.remove();
+  });
 }
 
-async function toggleAutostart(sw) {
+async function toggleAutostart(button, overlay) {
   try {
-    const on = await TAURI.autostart.isEnabled();
-    if (on) await TAURI.autostart.disable();
+    const enabled = await TAURI.autostart.isEnabled();
+    if (enabled) await TAURI.autostart.disable();
     else await TAURI.autostart.enable();
-    sw.classList.toggle("on", !on);
-  } catch (e) {}
+    const previousInitialized = state.settings.autostartInitialized;
+    state.settings.autostartInitialized = true;
+    let nextEnabled = !enabled;
+    if (!save()) {
+      state.settings.autostartInitialized = previousInitialized;
+      try {
+        if (enabled) await TAURI.autostart.enable();
+        else await TAURI.autostart.disable();
+        nextEnabled = enabled;
+        showPersistenceError(overlay);
+      } catch (rollbackError) {
+        console.error("Unable to restore the previous autostart setting", rollbackError);
+        try { nextEnabled = await TAURI.autostart.isEnabled(); } catch (_) {}
+        showPersistenceError(overlay, "设置未保存，且系统自启动状态可能未恢复，请重新检查此开关。");
+      }
+    } else clearPersistenceError(overlay);
+    button.classList.toggle("on", nextEnabled);
+    button.setAttribute("aria-checked", String(nextEnabled));
+  } catch (error) {
+    console.error("Unable to change the autostart setting", error);
+    showPersistenceError(overlay, "无法更改系统自启动设置，请稍后重试。");
+  }
+}
+
+async function ensureAutostart() {
+  if (state.settings.autostartInitialized || !TAURI?.autostart) return;
+  try {
+    await TAURI.autostart.enable();
+    state.settings.autostartInitialized = true;
+    save();
+  } catch (_) {}
 }
 
 async function exportBackup() {
   try {
-    await TAURI.core.invoke("export_data", { json: JSON.stringify(state, null, 2) });
-  } catch (e) {}
+    await TAURI?.core?.invoke("export_data", { json: JSON.stringify(state, null, 2) });
+  } catch (_) {}
 }
 
 async function importBackup(overlay) {
   try {
-    const content = await TAURI.core.invoke("import_data");
+    const content = await TAURI?.core?.invoke("import_data");
     if (!content) return;
-    const parsed = JSON.parse(content);
-    if (!parsed || !parsed.itemsByDay) return;
-    const base = defaultState();
-    state = {
-      ...base,
-      ...parsed,
-      itemsByDay: { ...base.itemsByDay, ...(parsed.itemsByDay || {}) },
-      settings: { ...base.settings, ...(parsed.settings || {}) },
-      memo: { ...base.memo, ...(parsed.memo || {}) },
-      recurringItems: parsed.recurringItems || [],
-    };
-    save();
+    const previousState = state;
+    state = migrateSnapshot(JSON.parse(content));
+    pruneTransientState();
+    if (!save()) {
+      state = previousState;
+      showPersistenceError(overlay);
+      return;
+    }
     overlay?.remove();
-    applyWindowChrome();
     render();
-  } catch (e) {}
+  } catch (_) {}
 }
 
-function hexToRgb(hex) {
-  const n = parseInt(hex.slice(1), 16);
-  return `${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}`;
-}
-function rgbToHex(rgb) {
-  const [r, g, b] = rgb.split(",").map((x) => parseInt(x.trim()));
-  return "#" + [r, g, b].map((x) => x.toString(16).padStart(2, "0")).join("");
-}
-
-/* ---------------- 完成撒花 ---------------- */
-
-const CONFETTI_COLORS = ["#1573ff", "#29ab56", "#ffb020", "#ff5d8f", "#7c5cff"];
-function celebrate(anchorEl) {
-  const r = anchorEl.getBoundingClientRect();
-  const cx = r.left + r.width / 2;
-  const cy = r.top + r.height / 2;
-  for (let i = 0; i < 14; i++) {
-    const p = document.createElement("div");
-    p.className = "confetti";
-    p.style.background = CONFETTI_COLORS[i % CONFETTI_COLORS.length];
-    p.style.left = cx + "px";
-    p.style.top = cy + "px";
-    const ang = (Math.PI * 2 * i) / 14 + Math.random() * 0.6;
-    const dist = 26 + Math.random() * 30;
-    p.style.setProperty("--dx", Math.cos(ang) * dist + "px");
-    p.style.setProperty("--dy", (Math.sin(ang) * dist - 18) + "px");
-    document.body.appendChild(p);
-    setTimeout(() => p.remove(), 700);
-  }
-}
-
-/* ---------------- 提醒通知 ---------------- */
-
-async function ensureNotifyPermission() {
+async function ensureNotificationPermission() {
   try {
-    const n = TAURI?.notification;
-    if (!n) return false;
-    let granted = await n.isPermissionGranted();
-    if (!granted) granted = (await n.requestPermission()) === "granted";
-    return granted;
-  } catch (e) {
+    if (!TAURI?.notification) return false;
+    const granted = await TAURI.notification.isPermissionGranted();
+    if (granted) return true;
+    if (notificationPermissionRequested) return false;
+    notificationPermissionRequested = true;
+    return (await TAURI.notification.requestPermission()) === "granted";
+  } catch (_) {
     return false;
   }
 }
 
-async function checkReminders() {
-  const now = nowHHMM();
-  const due = [];
+async function runReminderCheck() {
+  const now = new Date();
+  const nowTimestamp = now.getTime();
+  const dateKey = toDateKey(now);
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const dueTodos = state.items.filter((item) => {
+    if (item.completed || item.notified || !item.dueTime) return false;
+    const timestamp = dueTimestamp(item);
+    return timestamp <= nowTimestamp && timestamp >= startOfToday;
+  });
+  const dueRoutines = [];
+  (state.goals || []).filter((goal) => goal.status === "active").forEach((goal) => {
+    routinesForDate(goal, dateKey).forEach((routine) => {
+      const timestamp = dueTimestamp({ dueDate: dateKey, dueTime: routine.time || "" });
+      if (
+        routine.time &&
+        goal.records?.[dateKey]?.[routine.id] !== true &&
+        goal.notifiedRecords?.[dateKey]?.[routine.id] !== true &&
+        timestamp <= nowTimestamp && timestamp >= startOfToday
+      ) dueRoutines.push({ goal, routine });
+    });
+  });
+  if (!dueTodos.length && !dueRoutines.length) return;
+  if (!(await ensureNotificationPermission())) return;
+  if (toDateKey() !== dateKey) return;
+
   let changed = false;
-  const scan = (it) => {
-    if (it.time && !it.completed && !it.notified && it.time <= now) {
-      it.notified = true;
-      due.push(it);
+  for (const item of dueTodos) {
+    if (toDateKey() !== dateKey) break;
+    try {
+      await Promise.resolve(TAURI.notification.sendNotification({
+        title: "悬浮待办 · 到点提醒",
+        body: `${timeRangeLabel(item.dueTime, item.dueEndTime)}　${item.title}`,
+      }));
+      item.notified = true;
       changed = true;
-    }
-  };
-  state.itemsByDay.today.forEach(scan);
-  state.recurringItems.forEach(scan);
-  if (changed) save();
-  if (due.length) {
-    const ok = await ensureNotifyPermission();
-    if (ok) {
-      due.forEach((it) =>
-        TAURI.notification.sendNotification({
-          title: "悬浮待办 · 到点提醒",
-          body: `${it.time}　${it.title}`,
-        })
-      );
-    }
+    } catch (_) {}
+  }
+  for (const { goal, routine } of dueRoutines) {
+    if (toDateKey() !== dateKey) break;
+    try {
+      await Promise.resolve(TAURI.notification.sendNotification({
+        title: `${goal.title} · 今日计划`,
+        body: `${timeRangeLabel(routine.time, routine.endTime)}　${routine.title}`,
+      }));
+      goal.notifiedRecords ||= {};
+      goal.notifiedRecords[dateKey] ||= {};
+      goal.notifiedRecords[dateKey][routine.id] = true;
+      changed = true;
+    } catch (_) {}
+  }
+  if (changed) {
+    pruneTransientState(toDateKey());
+    save();
   }
 }
 
-/* ---------------- 窗口尺寸 / 缩放 ---------------- */
-
-function expandWindow() {
-  if (!appWindow || !TAURI?.window?.LogicalSize) return;
-  appWindow.setSize(new TAURI.window.LogicalSize(340, 560)).catch(() => {});
+async function checkReminders() {
+  if (reminderCheckRunning || !TAURI?.notification) return;
+  reminderCheckRunning = true;
+  try {
+    await runReminderCheck();
+  } catch (error) {
+    console.error("Unable to check reminders", error);
+  } finally {
+    reminderCheckRunning = false;
+  }
 }
 
-document.querySelectorAll(".resize").forEach((h) => {
-  h.addEventListener("mousedown", (e) => {
-    e.preventDefault();
-    appWindow?.startResizeDragging(h.dataset.dir).catch(() => {});
+function updateRelativeLabels() {
+  const today = toDateKey();
+  if (today === lastRenderedDate) return;
+  lastRenderedDate = today;
+  pruneTransientState(today);
+  save();
+  render();
+}
+
+function rememberWindowGeometry(position = null) {
+  if (!appWindow) return;
+  const width = Math.round(window.innerWidth);
+  const height = Math.round(window.innerHeight);
+  const next = {
+    ...(rememberedWindowState || {}),
+    width,
+    height,
+    compact,
+  };
+  if (position && Number.isFinite(position.x) && Number.isFinite(position.y)) {
+    next.x = position.x;
+    next.y = position.y;
+  }
+  if (!compact && width >= COMPACT_ENTER_WIDTH && height >= COMPACT_ENTER_HEIGHT) {
+    next.expandedWidth = width;
+    next.expandedHeight = height;
+  }
+  rememberedWindowState = normalizeWindowState(next);
+}
+
+function flushWindowState() {
+  if (!appWindow) return;
+  if (windowStateSaveTimer !== null) {
+    clearTimeout(windowStateSaveTimer);
+    windowStateSaveTimer = null;
+  }
+  rememberWindowGeometry();
+  if (!rememberedWindowState) return;
+  try {
+    localStorage.setItem(WINDOW_STATE_KEY, JSON.stringify(rememberedWindowState));
+  } catch (error) {
+    console.warn("Unable to persist window geometry", error);
+  }
+}
+
+function scheduleWindowStateSave(position = null) {
+  if (!appWindow) return;
+  rememberWindowGeometry(position);
+  if (windowStateSaveTimer !== null) clearTimeout(windowStateSaveTimer);
+  windowStateSaveTimer = setTimeout(flushWindowState, WINDOW_STATE_SAVE_DELAY);
+}
+
+async function restoreWindowState() {
+  if (!appWindow || !rememberedWindowState || !TAURI?.window?.LogicalSize) return;
+  try {
+    await appWindow.setSize(new TAURI.window.LogicalSize(
+      rememberedWindowState.width,
+      rememberedWindowState.height,
+    ));
+    if (
+      rememberedWindowState.x !== undefined && rememberedWindowState.y !== undefined &&
+      TAURI.window.PhysicalPosition && TAURI.window.availableMonitors
+    ) {
+      const monitors = await TAURI.window.availableMonitors();
+      if (isWindowPositionVisible(rememberedWindowState, monitors)) {
+        await appWindow.setPosition(new TAURI.window.PhysicalPosition(
+          rememberedWindowState.x,
+          rememberedWindowState.y,
+        ));
+      }
+    }
+  } catch (error) {
+    console.warn("Unable to restore window geometry", error);
+  }
+}
+
+async function bindWindowStatePersistence() {
+  if (!appWindow) return;
+  try {
+    const position = await appWindow.outerPosition();
+    rememberWindowGeometry(position);
+    flushWindowState();
+  } catch (_) {}
+  try {
+    const unlisten = await appWindow.onMoved(({ payload }) => scheduleWindowStateSave(payload));
+    windowEventUnlisteners.push(unlisten);
+  } catch (_) {}
+}
+
+async function listenToAppEvent(name, handler) {
+  if (!TAURI?.event?.listen) return;
+  try {
+    const unlisten = await TAURI.event.listen(name, handler);
+    windowEventUnlisteners.push(unlisten);
+  } catch (error) {
+    console.warn(`Unable to listen for ${name}`, error);
+  }
+}
+
+async function showReadyWindow() {
+  if (!appWindow) return;
+  try {
+    await appWindow.show();
+    await appWindow.setFocus();
+  } catch (error) {
+    console.warn("Unable to show the ready application window", error);
+  }
+}
+
+async function expandWindow() {
+  if (!appWindow || !TAURI?.window?.LogicalSize) return false;
+  const width = Math.max(
+    COMPACT_EXIT_WIDTH,
+    rememberedWindowState?.expandedWidth || WINDOW_LIMITS.defaultWidth,
+  );
+  const height = Math.max(
+    COMPACT_EXIT_HEIGHT,
+    rememberedWindowState?.expandedHeight || WINDOW_LIMITS.defaultHeight,
+  );
+  try {
+    await appWindow.setSize(new TAURI.window.LogicalSize(width, height));
+    compact = false;
+    document.documentElement.classList.remove("compact");
+    scheduleWindowStateSave();
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function updateCompact(renderOnChange = true) {
+  const next = compact
+    ? window.innerWidth < COMPACT_EXIT_WIDTH || window.innerHeight < COMPACT_EXIT_HEIGHT
+    : window.innerWidth < COMPACT_ENTER_WIDTH || window.innerHeight < COMPACT_ENTER_HEIGHT;
+  document.documentElement.classList.toggle("compact", next);
+  if (next === compact) return;
+  if (next) showAllCompleted = false;
+  compact = next;
+  if (renderOnChange) render();
+}
+
+document.querySelectorAll(".resize").forEach((handle) => {
+  handle.addEventListener("mousedown", (event) => {
+    event.preventDefault();
+    appWindow?.startResizeDragging(handle.dataset.dir).catch(() => {});
   });
 });
 
-function updateCompact() {
-  const w = window.innerWidth, hh = window.innerHeight;
-  const c = w < 300 || hh < 280;
-  if (c !== compact) { compact = c; document.documentElement.classList.toggle("compact", c); render(); }
-  else { document.documentElement.classList.toggle("compact", c); }
-}
-window.addEventListener("resize", updateCompact);
+const windowEventUnlisteners = [];
+let maintenanceTimer = null;
 
-/* ---------------- 全局快捷键：快速捕获 ---------------- */
-
-TAURI?.event?.listen?.("quick-capture", () => {
-  closeMenu();
-  document.querySelector(".overlay")?.remove();
-  if (compact) expandWindow();
-  focusMain = true;
+async function initializeApp() {
+  await restoreWindowState();
+  updateCompact(false);
+  overviewWidthTier = getOverviewWidthTier();
   render();
-  setTimeout(() => {
-    const mi = document.getElementById("main-input");
-    if (mi) { mi.focus(); mi.select(); }
-  }, 60);
+
+  window.addEventListener("resize", () => {
+    const previousCompact = compact;
+    updateCompact(false);
+    const nextOverviewWidthTier = getOverviewWidthTier();
+    const overviewTierChanged = nextOverviewWidthTier !== overviewWidthTier;
+    overviewWidthTier = nextOverviewWidthTier;
+    if (compact !== previousCompact || overviewTierChanged) render();
+    scheduleWindowStateSave();
+  });
+  await bindWindowStatePersistence();
+
+  await Promise.all([
+    listenToAppEvent("quick-capture", async () => {
+      document.querySelector(".overlay")?.remove();
+      if (compact) await expandWindow();
+      render();
+      openEditor();
+    }),
+    listenToAppEvent("toggle-passthrough", () => {
+      const previousValue = state.settings.clickThrough;
+      state.settings.clickThrough = !state.settings.clickThrough;
+      if (!save()) {
+        state.settings.clickThrough = previousValue;
+        render();
+      }
+      applyAppearance();
+    }),
+  ]);
+
+  await showReadyWindow();
+
+  ensureAutostart();
+  checkReminders();
+  maintenanceTimer = setInterval(() => {
+    updateRelativeLabels();
+    checkReminders();
+  }, 60_000);
+}
+
+window.addEventListener("beforeunload", () => {
+  flushWindowState();
+  if (maintenanceTimer !== null) clearInterval(maintenanceTimer);
+  windowEventUnlisteners.splice(0).forEach((unlisten) => unlisten());
+}, { once: true });
+
+initializeApp().catch((error) => {
+  console.error("Unable to initialize the application", error);
+  updateCompact(false);
+  overviewWidthTier = getOverviewWidthTier();
+  render();
+  showReadyWindow();
 });
-
-// 托盘「切换鼠标穿透」：翻转穿透开关（穿透开启时浮窗点不动，这是唯一可靠的关闭入口）
-TAURI?.event?.listen?.("toggle-passthrough", () => {
-  state.settings.clickThrough = !state.settings.clickThrough;
-  save();
-  applyWindowChrome();
-});
-
-/* ---------------- 启动 ---------------- */
-
-updateCompact();
-render();
-applyWindowChrome();
-
-// 跨午夜定期滚动 + 到点提醒
-setInterval(() => render(), 5 * 60 * 1000);
-setInterval(checkReminders, 30 * 1000);
-checkReminders();

@@ -31,6 +31,11 @@
   --panel-border: rgba(255, 255, 255, 0.64);
   --shadow: rgba(42, 49, 62, 0.18);
   --opacity: 0.92;
+  --motion-fast: 120ms;
+  --motion-base: 160ms;
+  --motion-sheet: 190ms;
+  --ease-apple: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-press: cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 html[data-theme="dark"] {
@@ -167,10 +172,9 @@ select:focus-visible {
   overflow: hidden;
   border: 1px solid var(--panel-border);
   border-radius: 22px;
-  background: linear-gradient(155deg, rgba(var(--panel-top), calc(var(--opacity) * 0.94)), rgba(var(--panel-bottom), calc(var(--opacity) * 0.84)));
-  box-shadow: 0 18px 48px var(--shadow), inset 0 1px rgba(255, 255, 255, 0.52), inset 0 -1px rgba(255, 255, 255, 0.12);
-  -webkit-backdrop-filter: blur(32px) saturate(1.45);
-  backdrop-filter: blur(32px) saturate(1.45);
+  background: linear-gradient(155deg, rgba(var(--panel-top), calc(var(--opacity) * 0.98)), rgba(var(--panel-bottom), calc(var(--opacity) * 0.94)));
+  box-shadow: 0 10px 28px var(--shadow), inset 0 1px rgba(255, 255, 255, 0.4), inset 0 -1px rgba(255, 255, 255, 0.1);
+  contain: layout paint style;
 }
 
 #app {
@@ -300,6 +304,12 @@ select:focus-visible {
   background: transparent;
   box-shadow: none;
   transition: background 0.16s ease;
+  contain: layout style;
+}
+
+.todo-row:not(.expanded) {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 70px;
 }
 
 .todo-row:not(:last-child)::after {
@@ -396,6 +406,25 @@ select:focus-visible {
   flex: 0 0 auto;
 }
 
+.meta-repeat {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--blue);
+  white-space: nowrap;
+}
+
+.meta-repeat svg {
+  width: 11px;
+  height: 11px;
+}
+
+.check:disabled,
+.subtask-check:disabled {
+  cursor: default;
+  opacity: 0.42;
+}
+
 .meta-status.pending,
 .meta-date,
 .meta-relative {
@@ -436,7 +465,7 @@ select:focus-visible {
   color: var(--tertiary);
   cursor: pointer;
   opacity: 0;
-  transition: color 0.16s ease, background 0.16s ease, transform 0.18s ease;
+  transition: color var(--motion-fast) ease-out, background-color var(--motion-fast) ease-out, opacity var(--motion-fast) ease-out, transform var(--motion-base) var(--ease-apple);
 }
 
 .chevron:hover {
@@ -459,7 +488,6 @@ select:focus-visible {
   margin: 0 12px 12px 48px;
   padding-top: 12px;
   border-top: 0.5px solid var(--separator);
-  animation: reveal 0.18s ease-out;
 }
 
 .description {
@@ -712,10 +740,8 @@ select:focus-visible {
   align-items: center;
   justify-content: center;
   padding: 15px;
-  background: rgba(20, 22, 28, 0.2);
-  -webkit-backdrop-filter: blur(10px) saturate(1.2);
-  backdrop-filter: blur(10px) saturate(1.2);
-  animation: fade-in 0.16s ease;
+  background: rgba(20, 22, 28, 0.3);
+  animation: fade-in var(--motion-base) ease-out;
 }
 
 .dialog {
@@ -728,11 +754,18 @@ select:focus-visible {
   padding: 18px;
   border: 1px solid var(--panel-border);
   border-radius: 14px;
-  background: linear-gradient(155deg, rgba(var(--panel-top), 0.98), rgba(var(--panel-bottom), 0.98));
-  box-shadow: 0 24px 64px rgba(20, 25, 38, 0.3), inset 0 1px rgba(255, 255, 255, 0.28);
-  -webkit-backdrop-filter: blur(36px) saturate(1.35);
-  backdrop-filter: blur(36px) saturate(1.35);
-  animation: sheet-in 0.2s ease-out;
+  background: rgb(var(--panel-top));
+  box-shadow: 0 14px 36px rgba(20, 25, 38, 0.24), inset 0 1px rgba(255, 255, 255, 0.22);
+  animation: sheet-in var(--motion-sheet) var(--ease-apple);
+}
+
+.overlay.is-closing {
+  pointer-events: none;
+  animation: fade-out var(--motion-fast) ease-in forwards;
+}
+
+.overlay.is-closing .dialog {
+  animation: sheet-out var(--motion-fast) ease-in forwards;
 }
 
 .editor-dialog {
@@ -790,7 +823,7 @@ select:focus-visible {
   background: var(--material);
   color: var(--label);
   font-size: 12px;
-  transition: border-color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
+  transition: border-color var(--motion-fast) ease-out, background-color var(--motion-fast) ease-out;
 }
 
 .field input,
@@ -1101,7 +1134,7 @@ select:focus-visible {
   border-radius: 8px;
   color: var(--secondary);
   font-size: 11px;
-  transition: color 0.16s ease, background 0.16s ease, box-shadow 0.16s ease;
+  transition: color var(--motion-fast) ease-out, background-color var(--motion-fast) ease-out;
 }
 
 .segmented button.on {
@@ -1649,7 +1682,7 @@ input[type="range"] {
 }
 
 .danger-btn:hover {
-  filter: brightness(0.94);
+  background: color-mix(in srgb, var(--red) 88%, black);
 }
 
 .create-options {
@@ -1833,6 +1866,84 @@ input[type="range"] {
   border-top: 0.5px solid var(--separator);
 }
 
+.routine-time-config {
+  grid-template-columns: 1fr;
+}
+
+.routine-schedule-field,
+.todo-schedule-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 9px;
+  border-top: 0.5px solid var(--separator);
+}
+
+.routine-schedule-field > span,
+.todo-schedule-field > span,
+.weekday-picker-wrap > span,
+.todo-weekday-picker > span {
+  color: var(--secondary);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.routine-schedule-options,
+.todo-schedule-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 2px;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--fill);
+}
+
+.routine-schedule-options label,
+.todo-schedule-options label {
+  position: relative;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.routine-schedule-options input,
+.todo-schedule-options input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.routine-schedule-options label > span,
+.todo-schedule-options label > span {
+  display: grid;
+  min-height: 27px;
+  place-items: center;
+  border-radius: 6px;
+  color: var(--secondary);
+  font-size: 10px;
+  font-weight: 600;
+  transition: color 120ms ease, background-color 120ms ease, transform 120ms ease;
+}
+
+.routine-schedule-options input:checked + span,
+.todo-schedule-options input:checked + span {
+  color: var(--label);
+  background: var(--material-strong);
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
+}
+
+.routine-schedule-options input:focus-visible + span,
+.todo-schedule-options input:focus-visible + span {
+  outline: 2px solid var(--blue);
+  outline-offset: 1px;
+}
+
+.routine-schedule-options label:active > span,
+.todo-schedule-options label:active > span {
+  transform: scale(0.98);
+}
+
 .routine-config-row label {
   display: flex;
   min-width: 0;
@@ -1916,15 +2027,44 @@ input[type="range"] {
   padding: 0 10px 8px;
 }
 
-.weekday-picker {
-  display: grid;
+.weekday-picker-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   padding: 0 9px 9px;
-  grid-template-columns: repeat(7, 1fr);
-  gap: 4px;
 }
 
-.weekday-picker.hidden {
+.todo-schedule-field {
+  padding: 0;
+  border-top: 0;
+}
+
+.todo-schedule-options {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.todo-weekday-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 10px 11px;
+  border: 0.5px solid var(--separator);
+  border-radius: 11px;
+  background: var(--material);
+}
+
+.todo-weekday-picker.hidden {
   display: none;
+}
+
+.weekday-picker-wrap.hidden {
+  display: none;
+}
+
+.weekday-picker {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 4px;
 }
 
 .weekday-picker button {
@@ -1970,9 +2110,7 @@ input[type="range"] {
   margin: 0 -18px -18px;
   padding: 11px 18px 18px;
   border-top: 0.5px solid var(--separator);
-  background: rgba(var(--panel-bottom), 0.94);
-  -webkit-backdrop-filter: blur(18px);
-  backdrop-filter: blur(18px);
+  background: rgb(var(--panel-bottom));
 }
 
 /* Personal horizon overview ------------------------------------------------ */
@@ -2038,6 +2176,7 @@ input[type="range"] {
   border-radius: 14px;
   background: var(--material);
   box-shadow: inset 0 1px rgba(255, 255, 255, 0.18), 0 4px 16px rgba(36, 43, 54, 0.04);
+  contain: layout style;
 }
 
 .overview-section-head {
@@ -2925,6 +3064,7 @@ html[data-theme="dark"] .overview-goal-list {
   border-radius: 15px;
   background: var(--material-strong);
   box-shadow: 0 7px 22px rgba(45, 55, 75, 0.09), inset 0 1px rgba(255, 255, 255, 0.36);
+  contain: layout style;
 }
 
 .dock-tab {
@@ -3678,16 +3818,52 @@ html[data-theme="dark"] .overview-goal-list {
   animation: shake 0.28s ease;
 }
 
+.motion-reveal {
+  animation: reveal var(--motion-base) var(--ease-apple);
+}
+
+.motion-view-enter {
+  animation: view-enter var(--motion-base) var(--ease-apple);
+}
+
+.motion-state-change {
+  animation: state-settle var(--motion-base) var(--ease-apple);
+}
+
+.motion-check-pop {
+  animation: check-pop 180ms var(--ease-apple);
+}
+
 @keyframes fade-in {
   from { opacity: 0; }
+}
+
+@keyframes fade-out {
+  to { opacity: 0; }
 }
 
 @keyframes sheet-in {
   from { opacity: 0; transform: translateY(10px) scale(0.98); }
 }
 
+@keyframes sheet-out {
+  to { opacity: 0; transform: translateY(4px) scale(0.99); }
+}
+
 @keyframes reveal {
   from { opacity: 0; transform: translateY(-3px); }
+}
+
+@keyframes view-enter {
+  from { opacity: 0.72; transform: translateY(3px); }
+}
+
+@keyframes state-settle {
+  45% { opacity: 0.82; transform: scale(0.992); }
+}
+
+@keyframes check-pop {
+  45% { transform: scale(1.08); }
 }
 
 @keyframes shake {
@@ -3718,9 +3894,8 @@ html[data-theme="dark"] .overview-goal-list {
   *::before,
   *::after {
     scroll-behavior: auto !important;
-    transition-duration: 0.01ms !important;
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
+    transition: none !important;
+    animation: none !important;
   }
 }
 

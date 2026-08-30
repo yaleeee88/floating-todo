@@ -222,6 +222,8 @@ function normalizeSubtasks(item, itemIndex) {
 
 const GOAL_STATUSES = new Set(["active", "paused", "completed"]);
 const ROUTINE_SCHEDULES = new Set(["daily", "weekdays", "custom"]);
+const TODO_SCHEDULES = new Set(["once", "daily", "weekdays", "custom"]);
+const LEGACY_DAILY_MIGRATION_DETAIL = "原版本中的“每天”待办，已迁移为今天的普通待办。";
 
 function validTimestamp(value, fallback = null) {
   const timestamp = Number(value);
@@ -253,6 +255,76 @@ function normalizeWeekdays(value) {
   if (!Array.isArray(value)) return [];
   return [...new Set(value.filter((day) => Number.isInteger(day) && day >= 0 && day <= 6))]
     .sort((a, b) => a - b);
+}
+
+function normalizeTodoRecords(records, subtaskIds) {
+  if (!records || typeof records !== "object" || Array.isArray(records)) return {};
+  const normalized = {};
+
+  for (const [dateKey, record] of Object.entries(records)) {
+    if (!fromDateKey(dateKey) || !record || typeof record !== "object" || Array.isArray(record)) {
+      continue;
+    }
+    const subtasks = {};
+    if (record.subtasks && typeof record.subtasks === "object" && !Array.isArray(record.subtasks)) {
+      for (const [subtaskId, completed] of Object.entries(record.subtasks)) {
+        if (completed === true && subtaskIds.has(subtaskId)) subtasks[subtaskId] = true;
+      }
+    }
+    const completed = record.completed === true;
+    normalized[dateKey] = {
+      completed,
+      completedAt: completed ? validTimestamp(record.completedAt) : null,
+      subtasks,
+    };
+  }
+
+  return normalized;
+}
+
+function normalizeTodoNotifiedRecords(records) {
+  if (!records || typeof records !== "object" || Array.isArray(records)) return {};
+  const normalized = {};
+  for (const [dateKey, notified] of Object.entries(records)) {
+    if (notified === true && fromDateKey(dateKey)) normalized[dateKey] = true;
+  }
+  return normalized;
+}
+
+function normalizeTodo(item, itemIndex) {
+  const timeRange = normalizeTimeRange(item.dueTime ?? item.time, item.dueEndTime ?? item.endTime);
+  const subtasks = normalizeSubtasks(item, itemIndex);
+  const subtaskIds = new Set(subtasks.map((subtask) => subtask.id));
+  const schedule = TODO_SCHEDULES.has(item.schedule) ? item.schedule : "once";
+  const { time: _legacyTime, endTime: _legacyEndTime, ...normalizedItem } = item;
+  return {
+    ...normalizedItem,
+    dueTime: timeRange.startTime,
+    dueEndTime: timeRange.endTime,
+    subtasks,
+    schedule,
+    weekdays: schedule === "custom" ? normalizeWeekdays(item.weekdays) : [],
+    records: normalizeTodoRecords(item.records, subtaskIds),
+    notifiedRecords: normalizeTodoNotifiedRecords(item.notifiedRecords),
+  };
+}
+
+function normalizeTodos(items) {
+  if (!Array.isArray(items)) return [];
+  const seenIds = new Set();
+  return items
+    .filter((item) => item && typeof item === "object")
+    .map((item, itemIndex) => {
+      let id = String(item.id || "").trim();
+      if (!id || seenIds.has(id)) {
+        const fallback = `todo-${itemIndex}`;
+        id = fallback;
+        let suffix = 2;
+        while (seenIds.has(id)) id = `${fallback}-${suffix++}`;
+      }
+      seenIds.add(id);
+      return normalizeTodo({ ...item, id }, itemIndex);
+    });
 }
 
 function normalizeRoutines(goal, goalId, goalStartDate) {
@@ -359,29 +431,52 @@ function normalizeGoals(goals, now) {
   });
 }
 
+function scheduleOccursOnWeekday(schedule, weekdays, weekday) {
+  if (schedule === "daily") return true;
+  if (schedule === "weekdays") return weekday >= 1 && weekday <= 5;
+  return Array.isArray(weekdays) && weekdays.includes(weekday);
+}
+
 export function routineOccursOnDate(routine, dateKey) {
   const date = fromDateKey(dateKey);
   if (!date || !routine || typeof routine !== "object") return false;
 
   const schedule = ROUTINE_SCHEDULES.has(routine.schedule) ? routine.schedule : "daily";
-  const weekday = date.getDay();
-  if (schedule === "daily") return true;
-  if (schedule === "weekdays") return weekday >= 1 && weekday <= 5;
-  return normalizeWeekdays(routine.weekdays).includes(weekday);
+  return scheduleOccursOnWeekday(schedule, routine.weekdays, date.getDay());
+}
+
+/**
+ * Whether a normal todo is scheduled for a local calendar date.
+ *
+ * `dueDate` is both the one-off date and the first effective date of a
+ * repeating todo. This keeps an item created for a future date from appearing
+ * on earlier matching weekdays.
+ */
+export function todoOccursOnDate(item, dateKey) {
+  const date = fromDateKey(dateKey);
+  if (!date || !item || typeof item !== "object" || !fromDateKey(item.dueDate)) return false;
+  if (dateKey < item.dueDate) return false;
+
+  const schedule = TODO_SCHEDULES.has(item.schedule) ? item.schedule : "once";
+  if (schedule === "once") return dateKey === item.dueDate;
+  return scheduleOccursOnWeekday(schedule, item.weekdays, date.getDay());
 }
 
 export function routinesForDate(goal, dateKey) {
-  if (!goal || typeof goal !== "object" || !fromDateKey(dateKey)) return [];
+  const date = fromDateKey(dateKey);
+  if (!goal || typeof goal !== "object" || !date) return [];
   const startDate = fromDateKey(goal.startDate) ? goal.startDate : "";
   const targetDate = fromDateKey(goal.targetDate) ? goal.targetDate : "";
   if ((startDate && dateKey < startDate) || (targetDate && dateKey > targetDate)) return [];
   if (!Array.isArray(goal.routines)) return [];
+  const weekday = date.getDay();
   return goal.routines.filter((routine) => {
     const routineStart = fromDateKey(routine?.startDate) ? routine.startDate : startDate;
     const routineEnd = fromDateKey(routine?.endDate) ? routine.endDate : "";
+    const schedule = ROUTINE_SCHEDULES.has(routine?.schedule) ? routine.schedule : "daily";
     return (!routineStart || dateKey >= routineStart)
       && (!routineEnd || dateKey <= routineEnd)
-      && routineOccursOnDate(routine, dateKey);
+      && scheduleOccursOnWeekday(schedule, routine?.weekdays, weekday);
   });
 }
 
@@ -474,7 +569,7 @@ export function goalWeekStats(goal, now = new Date()) {
 
 export function migrateSnapshot(snapshot, now = new Date()) {
   const base = {
-    version: 5,
+    version: 6,
     items: [],
     goals: [],
     filter: "open",
@@ -492,22 +587,51 @@ export function migrateSnapshot(snapshot, now = new Date()) {
   if (!snapshot || typeof snapshot !== "object") return base;
 
   if (Array.isArray(snapshot.items)) {
+    const sourceVersion = Number(snapshot.version);
+    const today = toDateKey(now);
     return {
       ...base,
       ...snapshot,
-      version: 5,
-      items: snapshot.items
+      version: 6,
+      items: normalizeTodos(snapshot.items
         .filter((item) => item && typeof item === "object")
-        .map((item, index) => {
-          const timeRange = normalizeTimeRange(item.dueTime ?? item.time, item.dueEndTime ?? item.endTime);
-          const { time: _legacyTime, endTime: _legacyEndTime, ...normalizedItem } = item;
+        .map((item, itemIndex) => {
+          const title = String(item.title || "").trim();
+          const detail = String(item.detail || "").trim();
+          const looksLikeV5DailyMigration = sourceVersion === 5
+            && !TODO_SCHEDULES.has(item.schedule)
+            && (title.startsWith("每日 · ") || detail === LEGACY_DAILY_MIGRATION_DETAIL);
+          if (!looksLikeV5DailyMigration) return item;
+
+          const occurrenceDate = fromDateKey(item.dueDate) ? item.dueDate : today;
+          const restoredTitle = title.startsWith("每日 · ")
+            ? title.slice("每日 · ".length).trim() || title
+            : title;
+          const completedSubtasks = Object.fromEntries(
+            (Array.isArray(item.subtasks) ? item.subtasks : [])
+              .filter((subtask) => subtask?.completed === true && String(subtask.id || "").trim())
+              .map((subtask) => [String(subtask.id).trim(), true]),
+          );
+          const hasRecord = item.completed === true || Object.keys(completedSubtasks).length > 0;
           return {
-            ...normalizedItem,
-            dueTime: timeRange.startTime,
-            dueEndTime: timeRange.endTime,
-            subtasks: normalizeSubtasks(item, index),
+            ...item,
+            title: restoredTitle,
+            detail: detail === LEGACY_DAILY_MIGRATION_DETAIL ? "" : item.detail,
+            schedule: "daily",
+            weekdays: [],
+            records: hasRecord ? {
+              [occurrenceDate]: {
+                completed: item.completed === true,
+                completedAt: item.completed === true ? item.completedAt : null,
+                subtasks: completedSubtasks,
+              },
+            } : {},
+            notifiedRecords: item.notified === true ? { [occurrenceDate]: true } : {},
+            completed: false,
+            completedAt: null,
+            notified: false,
           };
-        }),
+        })),
       goals: normalizeGoals(snapshot.goals, now),
       expandedIds: Array.isArray(snapshot.expandedIds) ? snapshot.expandedIds : [],
       settings: { ...base.settings, ...(snapshot.settings || {}) },
@@ -520,7 +644,7 @@ export function migrateSnapshot(snapshot, now = new Date()) {
   for (const [day, offset] of Object.entries(offsets)) {
     for (const item of snapshot.itemsByDay?.[day] || []) {
       const timeRange = normalizeTimeRange(item.time ?? item.dueTime, item.endTime ?? item.dueEndTime);
-      migrated.push({
+      migrated.push(normalizeTodo({
         id: item.id,
         title: item.title,
         detail: item.detail || "",
@@ -532,29 +656,36 @@ export function migrateSnapshot(snapshot, now = new Date()) {
         completedAt: item.completed ? Date.now() : null,
         notified: !!item.notified,
         createdAt: item.createdAt || Date.now(),
-      });
+      }, migrated.length));
     }
   }
   for (const item of snapshot.recurringItems || []) {
     const timeRange = normalizeTimeRange(item.time ?? item.dueTime, item.endTime ?? item.dueEndTime);
-    migrated.push({
+    const completedAt = item.completed ? validTimestamp(item.completedAt, Date.now()) : null;
+    migrated.push(normalizeTodo({
       id: item.id,
-      title: `每日 · ${item.title}`,
-      detail: item.detail || "原版本中的“每天”待办，已迁移为今天的普通待办。",
+      title: item.title,
+      detail: item.detail || "",
       subtasks: [],
       dueDate: today,
       dueTime: timeRange.startTime,
       dueEndTime: timeRange.endTime,
-      completed: !!item.completed,
-      completedAt: item.completed ? Date.now() : null,
-      notified: !!item.notified,
+      schedule: "daily",
+      weekdays: [],
+      records: item.completed
+        ? { [today]: { completed: true, completedAt, subtasks: {} } }
+        : {},
+      notifiedRecords: item.notified ? { [today]: true } : {},
+      completed: false,
+      completedAt: null,
+      notified: false,
       createdAt: item.createdAt || Date.now(),
-    });
+    }, migrated.length));
   }
 
   return {
     ...base,
-    items: migrated,
+    items: normalizeTodos(migrated),
     goals: normalizeGoals(snapshot.goals, now),
     settings: { ...base.settings, ...(snapshot.settings || {}) },
   };

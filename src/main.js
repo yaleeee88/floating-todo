@@ -12,6 +12,7 @@ import {
   migrateSnapshot,
   routineOccursOnDate,
   routinesForDate,
+  todoOccursOnDate,
   toDateKey,
 } from "./domain.js";
 import {
@@ -22,6 +23,7 @@ import {
 
 const TAURI = window.__TAURI__;
 const appWindow = TAURI?.window?.getCurrentWindow?.();
+const reducedMotionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
 const STORAGE_KEY = "floating-todo/snapshot";
 const WINDOW_STATE_KEY = "floating-todo/window-state-v1";
 const WINDOW_STATE_SAVE_DELAY = 220;
@@ -31,9 +33,10 @@ const COMPACT_EXIT_WIDTH = 312;
 const COMPACT_EXIT_HEIGHT = 272;
 const OVERVIEW_WIDE_BREAKPOINT = 720;
 const OVERVIEW_LARGE_BREAKPOINT = 1100;
-const COMPLETED_RENDER_LIMIT = 30;
+const COMPLETED_RENDER_LIMIT = 16;
 const app = document.getElementById("app");
 document.documentElement.classList.toggle("browser-preview", !TAURI);
+document.documentElement.classList.toggle("native-app", !!TAURI);
 
 if ("scrollRestoration" in history) history.scrollRestoration = "manual";
 window.scrollTo(0, 0);
@@ -63,6 +66,8 @@ let compact = rememberedWindowState?.compact === true;
 let lastRenderedDate = toDateKey();
 let statusAnnouncement = "";
 let windowStateSaveTimer = null;
+let stateSaveTimer = null;
+let appearanceFrame = null;
 let reminderCheckRunning = false;
 let notificationPermissionRequested = false;
 let appliedAlwaysOnTop;
@@ -70,6 +75,8 @@ let appliedClickThrough;
 let showAllCompleted = false;
 let activeMainView = "overview";
 let overviewWidthTier = getOverviewWidthTier();
+let lastRenderedMainView = null;
+let pendingMotionCue = null;
 const viewScrollTop = { overview: 0, list: 0 };
 
 function getOverviewWidthTier(width = window.innerWidth) {
@@ -79,6 +86,10 @@ function getOverviewWidthTier(width = window.innerWidth) {
 }
 
 function save() {
+  if (stateSaveTimer !== null) {
+    clearTimeout(stateSaveTimer);
+    stateSaveTimer = null;
+  }
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     return true;
@@ -89,8 +100,23 @@ function save() {
   }
 }
 
-function cloneState() {
-  return JSON.parse(JSON.stringify(state));
+function cloneValue(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function scheduleStateSave() {
+  if (stateSaveTimer !== null) clearTimeout(stateSaveTimer);
+  stateSaveTimer = setTimeout(() => {
+    stateSaveTimer = null;
+    if (!save()) render();
+  }, 400);
+}
+
+function flushStateSave() {
+  if (stateSaveTimer === null) return;
+  clearTimeout(stateSaveTimer);
+  stateSaveTimer = null;
+  save();
 }
 
 function persistMutation(mutate) {
@@ -133,6 +159,11 @@ function pruneTransientState(dateKey = toDateKey()) {
   for (const goal of state.goals || []) {
     const todayNotifications = goal.notifiedRecords?.[dateKey];
     goal.notifiedRecords = todayNotifications ? { [dateKey]: todayNotifications } : {};
+  }
+  for (const item of state.items || []) {
+    if (!isRecurringTodo(item)) continue;
+    const notifiedToday = item.notifiedRecords?.[dateKey] === true;
+    item.notifiedRecords = notifiedToday ? { [dateKey]: true } : {};
   }
 }
 
@@ -230,6 +261,93 @@ function showTimeEditorError(root, result) {
   setTimeout(() => root?.classList.remove("shake"), 300);
 }
 
+function preferredScrollBehavior() {
+  return reducedMotionQuery.matches ? "auto" : "smooth";
+}
+
+function queueMotionCue(type, id, routineId = "", subtaskId = "") {
+  pendingMotionCue = { type, id, routineId, subtaskId };
+}
+
+function playPendingMotionCue() {
+  const cue = pendingMotionCue;
+  pendingMotionCue = null;
+  if (!cue || reducedMotionQuery.matches) return;
+
+  const matching = [...app.querySelectorAll("[data-id]")].filter((element) =>
+    element.dataset.id === cue.id &&
+    (!cue.routineId || element.dataset.routineId === cue.routineId) &&
+    (!cue.subtaskId || element.dataset.subtaskId === cue.subtaskId)
+  );
+  if (cue.type === "expand") {
+    const expanded = matching
+      .map((element) => element.closest(".todo-row"))
+      .find((row) => row?.querySelector(".todo-expanded"));
+    expanded?.querySelector(".todo-expanded")?.classList.add("motion-reveal");
+    return;
+  }
+
+  const rows = new Set(matching.map((element) =>
+    element.closest(".overview-action, .todo-row, .overview-goal, .nearest-node, .horizon-entry")
+  ).filter(Boolean));
+  rows.forEach((row) => {
+    row.classList.add("motion-state-change");
+    row.querySelector(".check.on, .overview-check.on, .subtask-check.on, .goal-progress.complete")
+      ?.classList.add("motion-check-pop");
+  });
+}
+
+function captureFocusDescriptor(element = document.activeElement) {
+  const control = element?.closest?.("[data-act]");
+  if (!control || !app.contains(control)) return null;
+  return {
+    act: control.dataset.act || "",
+    id: control.dataset.id || "",
+    routineId: control.dataset.routineId || "",
+    subtaskId: control.dataset.subtaskId || "",
+    bucket: control.dataset.bucket || "",
+    focusScope: control.dataset.focusScope || "",
+  };
+}
+
+function restoreFocusDescriptor(descriptor) {
+  if (!descriptor?.act) return;
+  const restored = [...app.querySelectorAll(`[data-act="${descriptor.act}"]`)].find((element) =>
+    (element.dataset.id || "") === descriptor.id &&
+    (element.dataset.routineId || "") === descriptor.routineId &&
+    (element.dataset.subtaskId || "") === descriptor.subtaskId &&
+    (element.dataset.bucket || "") === descriptor.bucket &&
+    (element.dataset.focusScope || "") === descriptor.focusScope
+  );
+  restored?.focus({ preventScroll: true });
+}
+
+function dismissOverlay(overlay, onRemoved) {
+  if (!overlay?.isConnected) {
+    onRemoved?.();
+    return;
+  }
+  if (overlay.classList.contains("is-closing")) return;
+  if (reducedMotionQuery.matches) {
+    overlay.remove();
+    onRemoved?.();
+    return;
+  }
+  let fallbackTimer = null;
+  const finish = () => {
+    if (fallbackTimer !== null) clearTimeout(fallbackTimer);
+    overlay.removeEventListener("animationend", onAnimationEnd);
+    overlay.remove();
+    onRemoved?.();
+  };
+  const onAnimationEnd = (event) => {
+    if (event.target === overlay) finish();
+  };
+  overlay.addEventListener("animationend", onAnimationEnd);
+  overlay.classList.add("is-closing");
+  fallbackTimer = setTimeout(finish, 180);
+}
+
 const ICONS = {
   reminders: '<svg viewBox="0 0 44 44" width="44" height="44" aria-hidden="true"><circle cx="11" cy="13" r="4" fill="#ff9f0a"/><path d="m9.2 13 1.2 1.2 2.3-2.5" fill="none" stroke="white" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="11" cy="22" r="4" fill="#34c759"/><path d="m9.2 22 1.2 1.2 2.3-2.5" fill="none" stroke="white" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="11" cy="31" r="4" fill="#0a84ff"/><path d="m9.2 31 1.2 1.2 2.3-2.5" fill="none" stroke="white" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><path d="M19 13h15M19 22h15M19 31h11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" opacity=".58"/></svg>',
   check: '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>',
@@ -267,7 +385,14 @@ function goalSortTimestamp(goal, dateKey = toDateKey()) {
 }
 
 function timelineTier(entry, dateKey = toDateKey()) {
-  if (entry.kind === "todo") return entry.value.completed ? 4 : 0;
+  if (entry.kind === "todo") {
+    const item = entry.value;
+    if (!isRecurringTodo(item)) return item.completed ? 4 : 0;
+    // Future recurring occurrences belong in the same pending tier as one-off
+    // todos, so the shared due timestamp can keep the list truly chronological.
+    if (!todoOccursOnDate(item, dateKey)) return 0;
+    return todoCompletedForDate(item, dateKey) ? 1 : 0;
+  }
   const goal = entry.value;
   if (goal.status === "completed") return 4;
   if (goal.status === "paused") return 3;
@@ -285,8 +410,15 @@ function getTimelineEntries() {
   ].map((entry) => ({
     entry,
     tier: timelineTier(entry, dateKey),
-    due: entry.kind === "todo" ? dueTimestamp(entry.value) : goalSortTimestamp(entry.value, dateKey),
-    completedAt: entry.value.completedAt || 0,
+    due: entry.kind === "todo"
+      ? dueTimestamp({
+          dueDate: nextTodoOccurrence(entry.value, dateKey),
+          dueTime: entry.value.dueTime || "",
+        })
+      : goalSortTimestamp(entry.value, dateKey),
+    completedAt: entry.kind === "todo" && isRecurringTodo(entry.value)
+      ? todoRecordForDate(entry.value, dateKey)?.completedAt || 0
+      : entry.value.completedAt || 0,
     createdAt: entry.value.createdAt || 0,
   }));
   return entries.sort((a, b) => {
@@ -301,7 +433,7 @@ function limitCompletedEntries(entries) {
   let completedCount = 0;
   const visibleEntries = entries.filter((entry) => {
     const completed = entry.kind === "todo"
-      ? !!entry.value.completed
+      ? !isRecurringTodo(entry.value) && !!entry.value.completed
       : entry.value.status === "completed";
     if (!completed) return true;
     completedCount += 1;
@@ -315,12 +447,18 @@ function limitCompletedEntries(entries) {
 }
 
 function headerStatusSummary() {
-  const pendingTodos = state.items.filter((item) => !item.completed).length;
+  const dateKey = toDateKey();
+  const pendingTodos = state.items.filter((item) => isRecurringTodo(item)
+    ? todoOccursOnDate(item, dateKey) && !todoCompletedForDate(item, dateKey)
+    : !item.completed
+  ).length;
+  const recurringPlans = state.items.filter(isRecurringTodo).length;
   const activeGoals = (state.goals || []).filter((goal) => goal.status === "active").length;
   const pausedGoals = (state.goals || []).filter((goal) => goal.status === "paused").length;
   const parts = [];
   if (pendingTodos) parts.push(`${pendingTodos} 项待办`);
   if (activeGoals) parts.push(`${activeGoals} 个目标`);
+  if (!pendingTodos && !activeGoals && recurringPlans) parts.push(`${recurringPlans} 项重复计划`);
   if (!pendingTodos && !activeGoals && pausedGoals) parts.push(`${pausedGoals} 个目标已暂停`);
   return parts.length ? parts.join(" · ") : "全部完成";
 }
@@ -420,58 +558,76 @@ function todayHeaderLabel() {
 }
 
 function rowHtml(item) {
+  const dateKey = toDateKey();
+  const safeItemId = esc(item.id);
+  const detailsId = `todo-details-${item.id}`;
+  const safeDetailsId = esc(detailsId);
+  const recurring = isRecurringTodo(item);
+  const occursToday = recurring && todoOccursOnDate(item, dateKey);
+  const displayDate = recurring ? nextTodoOccurrence(item, dateKey) : item.dueDate;
+  const completed = recurring
+    ? occursToday && todoCompletedForDate(item, dateKey)
+    : todoCompletedForDate(item, dateKey);
+  const canToggle = !recurring || occursToday;
   const expanded = !compact && state.expandedIds.includes(item.id);
-  const distance = dayDistance(item.dueDate);
+  const distance = dayDistance(displayDate);
   const distanceClass = distance < 0 ? "overdue" : distance === 0 ? "today" : "";
-  const statusClass = item.completed ? "completed" : "pending";
-  const statusText = item.completed ? "已完成" : "待完成";
+  const statusClass = completed ? "completed" : "pending";
+  const statusText = completed ? "已完成" : recurring && !occursToday ? "下次" : "待完成";
   const itemTimeLabel = timeRangeLabel(item.dueTime, item.dueEndTime, "");
-  const dateTimeText = `${shortDateLabel(item.dueDate)}${itemTimeLabel ? ` ${itemTimeLabel}` : ""}`;
+  const dateTimeText = `${shortDateLabel(displayDate)}${itemTimeLabel ? ` ${itemTimeLabel}` : ""}`;
+  const repeatLabel = todoScheduleLabel(item);
   const subtasks = Array.isArray(item.subtasks) ? item.subtasks : [];
-  const completedSubtasks = subtasks.filter((subtask) => subtask.completed).length;
+  const completedSubtasks = subtasks.filter((subtask) =>
+    (!recurring || occursToday) && todoSubtaskCompletedForDate(item, subtask.id, dateKey)
+  ).length;
   const subtasksHtml = expanded && subtasks.length
     ? `<section class="subtask-section" aria-label="子待办">
         <div class="subtask-head"><span>子待办</span><span aria-label="${subtasks.length} 个子待办中已完成 ${completedSubtasks} 个">${completedSubtasks}/${subtasks.length} 已完成</span></div>
         <ul class="subtask-list" aria-label="${esc(item.title)}的子待办">
-          ${subtasks.map((subtask) => `<li class="subtask-row ${subtask.completed ? "done" : ""}">
-            <button class="subtask-check ${subtask.completed ? "on" : ""}" data-act="subtask-toggle" data-id="${esc(item.id)}" data-subtask-id="${esc(subtask.id)}" role="checkbox" aria-checked="${subtask.completed}" aria-label="${subtask.completed ? "恢复" : "完成"}子待办：${esc(subtask.title)}">${subtask.completed ? ICONS.check : ""}</button>
+          ${subtasks.map((subtask) => {
+            const subtaskCompleted = (!recurring || occursToday) &&
+              todoSubtaskCompletedForDate(item, subtask.id, dateKey);
+            return `<li class="subtask-row ${subtaskCompleted ? "done" : ""}">
+            <button class="subtask-check ${subtaskCompleted ? "on" : ""}" data-act="subtask-toggle" data-id="${esc(item.id)}" data-subtask-id="${esc(subtask.id)}" role="checkbox" aria-checked="${subtaskCompleted}" ${canToggle ? "" : "disabled"} aria-label="${subtaskCompleted ? "恢复" : "完成"}子待办：${esc(subtask.title)}">${subtaskCompleted ? ICONS.check : ""}</button>
             <span>${esc(subtask.title)}</span>
-          </li>`).join("")}
+          </li>`;
+          }).join("")}
         </ul>
       </section>`
     : "";
   const details = expanded
-    ? `<div class="todo-expanded">
+    ? `<div class="todo-expanded" id="${safeDetailsId}">
         ${item.detail
           ? `<div class="description">${linkify(item.detail)}</div>`
           : subtasks.length ? "" : '<div class="description muted">暂无更多说明</div>'}
         ${subtasksHtml}
         <div class="expanded-footer">
           <div class="row-actions">
-            <button class="text-action" data-act="edit" data-id="${item.id}">${ICONS.edit} 编辑</button>
-            <button class="text-action danger" data-act="delete" data-id="${item.id}">${ICONS.trash} 删除</button>
+            <button class="text-action" data-act="edit" data-id="${safeItemId}">${ICONS.edit} 编辑</button>
+            <button class="text-action danger" data-act="delete" data-id="${safeItemId}">${ICONS.trash} 删除</button>
           </div>
         </div>
       </div>`
     : "";
 
-  const detailsId = `todo-details-${item.id}`;
-  return `<article class="todo-row ${item.completed ? "done" : ""} ${expanded ? "expanded" : ""}" data-id="${item.id}">
+  return `<article class="todo-row ${completed ? "done" : ""} ${recurring ? "recurring" : ""} ${expanded ? "expanded" : ""}" data-id="${safeItemId}">
     <div class="todo-summary">
-      <button class="check ${item.completed ? "on" : ""}" data-act="toggle" data-id="${item.id}" aria-pressed="${item.completed}" aria-label="${item.completed ? `恢复待办：${esc(item.title)}` : `完成待办：${esc(item.title)}`}">${item.completed ? ICONS.check : ""}</button>
-      <button class="todo-main" data-act="expand" data-id="${item.id}" aria-expanded="${expanded}" aria-controls="${detailsId}">
+      <button class="check ${completed ? "on" : ""}" data-act="toggle" data-id="${safeItemId}" aria-pressed="${completed}" ${canToggle ? "" : "disabled"} aria-label="${completed ? `恢复待办：${esc(item.title)}` : `完成待办：${esc(item.title)}`}">${completed ? ICONS.check : ""}</button>
+      <button class="todo-main" data-act="expand" data-id="${safeItemId}" aria-expanded="${expanded}" aria-controls="${safeDetailsId}">
         <span class="todo-title">${esc(item.title)}</span>
         <span class="todo-meta">
           <span class="meta-status ${statusClass}">${statusText}</span>
           <span class="meta-dot">·</span>
-          <time class="meta-date" datetime="${esc(item.dueDate)}${item.dueTime ? `T${esc(item.dueTime)}` : ""}" aria-label="${esc(`${shortDateLabel(item.dueDate)}${itemTimeLabel ? ` ${timeRangeAriaLabel(item.dueTime, item.dueEndTime)}` : ""}`)}">${esc(dateTimeText)}</time>
-          ${item.completed ? "" : `<span class="meta-dot">·</span><span class="meta-relative ${distanceClass}" data-relative="${esc(item.dueDate)}">${compactRelativeLabel(item.dueDate)}</span>`}
+          <time class="meta-date" datetime="${esc(displayDate)}${item.dueTime ? `T${esc(item.dueTime)}` : ""}" aria-label="${esc(`${shortDateLabel(displayDate)}${itemTimeLabel ? ` ${timeRangeAriaLabel(item.dueTime, item.dueEndTime)}` : ""}`)}">${esc(dateTimeText)}</time>
+          ${repeatLabel ? `<span class="meta-dot">·</span><span class="meta-repeat">${ICONS.repeat} ${esc(repeatLabel)}</span>` : ""}
+          ${completed ? "" : `<span class="meta-dot">·</span><span class="meta-relative ${distanceClass}" data-relative="${esc(displayDate)}">${compactRelativeLabel(displayDate)}</span>`}
           ${subtasks.length ? `<span class="meta-dot">·</span><span class="meta-subtasks" aria-label="${subtasks.length} 个子待办中已完成 ${completedSubtasks} 个">${completedSubtasks}/${subtasks.length} 子待办</span>` : ""}
         </span>
       </button>
       <span class="chevron ${expanded ? "up" : ""}" data-act="expand" data-id="${esc(item.id)}" aria-hidden="true">${ICONS.arrow}</span>
     </div>
-    ${expanded ? details.replace('<div class="todo-expanded">', `<div class="todo-expanded" id="${detailsId}">`) : ""}
+    ${details}
   </article>`;
 }
 
@@ -575,6 +731,7 @@ function goalRowHtml(goal) {
 function getOverviewTodayActions(dateKey = toDateKey()) {
   const todoActions = state.items
     .filter((item) => {
+      if (isRecurringTodo(item)) return todoOccursOnDate(item, dateKey);
       const distance = dayDistance(item.dueDate);
       if (!Number.isFinite(distance) || distance > 0) return false;
       return !item.completed || item.dueDate === dateKey;
@@ -583,11 +740,14 @@ function getOverviewTodayActions(dateKey = toDateKey()) {
       kind: "todo",
       id: item.id,
       title: item.title,
-      context: item.dueDate === dateKey ? "普通待办" : compactRelativeLabel(item.dueDate),
-      dateKey: item.dueDate,
+      context: isRecurringTodo(item)
+        ? todoScheduleLabel(item)
+        : item.dueDate === dateKey ? "普通待办" : compactRelativeLabel(item.dueDate),
+      dateKey: isRecurringTodo(item) ? dateKey : item.dueDate,
       startTime: item.dueTime || "",
       endTime: item.dueEndTime || "",
-      completed: !!item.completed,
+      completed: todoCompletedForDate(item, dateKey),
+      recurring: isRecurringTodo(item),
       createdAt: item.createdAt || 0,
     }));
   const routineActions = getTodayGoalActions(dateKey).map(({ goal, routine, completed }) => ({
@@ -617,7 +777,7 @@ function overviewActionRowHtml(action) {
   const toggleAct = isTodo ? "toggle" : "goal-routine-toggle";
   const revealAct = isTodo ? "todo-reveal" : "goal-reveal";
   const timeLabel = timeRangeLabel(action.startTime, action.endTime, "");
-  const overdue = isTodo && dayDistance(action.dateKey) < 0;
+  const overdue = isTodo && !action.recurring && dayDistance(action.dateKey) < 0;
   return `<li class="overview-action ${action.completed ? "done" : ""} ${overdue ? "overdue" : ""}">
     <button class="overview-check ${action.completed ? "on" : ""}" data-act="${toggleAct}" data-id="${esc(action.id)}" ${isTodo ? "" : `data-routine-id="${esc(action.routineId)}" data-focus-scope="overview"`} role="checkbox" aria-checked="${action.completed}" aria-label="${action.completed ? "恢复" : "完成"}${esc(action.title)}">${action.completed ? ICONS.check : ""}</button>
     <button class="overview-action-main" data-act="${revealAct}" data-id="${esc(action.id)}" aria-label="查看${esc(action.title)}详情">
@@ -674,13 +834,8 @@ function horizonBucketHtml(key, label, entries, allEntries = entries) {
   </div>`;
 }
 
-function horizonOverviewHtml(futureEntries) {
+function horizonOverviewHtml(futureEntries, buckets, allBuckets) {
   const nearest = futureEntries[0];
-  const remainingEntries = nearest
-    ? futureEntries.filter((entry) => !(entry.kind === nearest.kind && entry.id === nearest.id))
-    : futureEntries;
-  const allBuckets = bucketFutureHorizonEntries(futureEntries);
-  const buckets = bucketFutureHorizonEntries(remainingEntries);
   return `<section class="overview-card nearest-card" aria-labelledby="nearest-title">
       <div class="overview-section-kicker" id="nearest-title">最近节点</div>
       ${nearest
@@ -780,6 +935,22 @@ function applyAppearance() {
   }
 }
 
+function scheduleAppearanceUpdate() {
+  if (appearanceFrame !== null) return;
+  appearanceFrame = requestAnimationFrame(() => {
+    appearanceFrame = null;
+    applyAppearance();
+  });
+}
+
+function flushAppearanceUpdate() {
+  if (appearanceFrame !== null) {
+    cancelAnimationFrame(appearanceFrame);
+    appearanceFrame = null;
+  }
+  applyAppearance();
+}
+
 function render() {
   const previousMain = app.querySelector(".main-scroll");
   const previousView = previousMain?.dataset.mainView;
@@ -803,8 +974,19 @@ function render() {
     : limitCompletedEntries(allEntries);
   const entries = completedView.entries;
   const todayActions = overview ? getOverviewTodayActions() : [];
-  const futureEntries = overview ? buildFutureHorizonEntries(state.items, state.goals || []) : [];
-  const horizonBuckets = overview ? bucketFutureHorizonEntries(futureEntries.slice(1)) : null;
+  const futureEntries = overview
+    ? buildFutureHorizonEntries(state.items.filter((item) => !isRecurringTodo(item)), state.goals || [])
+    : [];
+  const allHorizonBuckets = overview ? bucketFutureHorizonEntries(futureEntries) : null;
+  const nearestFuture = futureEntries[0];
+  const horizonBuckets = allHorizonBuckets
+    ? Object.fromEntries(Object.entries(allHorizonBuckets).map(([key, entries]) => [
+        key,
+        nearestFuture
+          ? entries.filter((entry) => !(entry.kind === nearestFuture.kind && entry.id === nearestFuture.id))
+          : entries,
+      ]))
+    : null;
   const horizonDensity = horizonBuckets
     ? Math.max(0, ...Object.values(horizonBuckets).map((bucket) => Math.min(3, bucket.length)))
     : 0;
@@ -814,7 +996,7 @@ function render() {
     : `${todayHeaderLabel()} · ${headerStatusSummary()}`;
   const mainContent = overview
     ? `${overviewTodayHtml(todayActions)}
-      ${horizonOverviewHtml(futureEntries)}
+      ${horizonOverviewHtml(futureEntries, horizonBuckets, allHorizonBuckets)}
       ${overviewGoalsHtml(pendingToday, horizonDensity)}`
     : `${todayGoalActionsHtml()}
       ${allEntries.length
@@ -824,6 +1006,7 @@ function render() {
         ? `<button class="completed-overflow" data-act="completed-overflow">${showAllCompleted ? "收起较早完成项" : `显示更早已完成 · ${completedView.hiddenCount}`}</button>`
         : ""}`;
 
+  const animateView = renderedView !== lastRenderedMainView;
   app.innerHTML = `
     <header class="header ${overview ? "horizon-header" : "list-header"}" data-drag-region>
       ${overview ? "" : `<div class="app-symbol">${ICONS.reminders}</div>`}
@@ -832,11 +1015,12 @@ function render() {
       <button class="icon-btn" data-act="settings" title="设置" aria-label="设置">${ICONS.gear}</button>
     </header>
 
-    <main class="${overview ? `overview-screen ${pendingToday >= 3 ? "many-today" : ""}` : "timeline"} main-scroll" data-main-view="${renderedView}">${mainContent}</main>
+    <main class="${overview ? `overview-screen ${pendingToday >= 3 ? "many-today" : ""}` : "timeline"} main-scroll ${animateView ? "motion-view-enter" : ""}" data-main-view="${renderedView}">${mainContent}</main>
     ${compact ? "" : overviewDockHtml(renderedView)}
     ${compact ? '<button class="compact-open" data-act="grow">展开</button>' : ""}
     <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">${esc(statusAnnouncement)}</div>
   `;
+  lastRenderedMainView = renderedView;
 
   const main = app.querySelector(".main-scroll");
   if (main) main.scrollTop = viewScrollTop[renderedView] || 0;
@@ -850,6 +1034,7 @@ function render() {
       );
     restored?.focus({ preventScroll: true });
   }
+  playPendingMotionCue();
   statusAnnouncement = "";
 }
 
@@ -862,6 +1047,9 @@ app.addEventListener("mousedown", (event) => {
 function addTodo(data) {
   const title = data.title.trim();
   if (!title || !data.dueDate) return false;
+  const schedule = ["once", "daily", "weekdays", "custom"].includes(data.schedule)
+    ? data.schedule
+    : "once";
   const item = {
     id: uid(),
     title,
@@ -874,6 +1062,14 @@ function addTodo(data) {
     dueDate: data.dueDate,
     dueTime: data.dueTime || "",
     dueEndTime: data.dueEndTime || "",
+    schedule,
+    weekdays: schedule === "custom"
+      ? [...new Set(data.weekdays || [])]
+          .filter((day) => Number.isInteger(day) && day >= 0 && day <= 6)
+          .sort((a, b) => a - b)
+      : [],
+    records: {},
+    notifiedRecords: {},
     completed: false,
     completedAt: null,
     notified: false,
@@ -889,8 +1085,38 @@ function addTodo(data) {
 
 function toggleTodo(id) {
   if (!state.items.some((todo) => todo.id === id)) return;
-  persistMutation(() => {
+  const dateKey = toDateKey();
+  const target = state.items.find((todo) => todo.id === id);
+  if (isRecurringTodo(target) && !todoOccursOnDate(target, dateKey)) return;
+  const persisted = persistMutation(() => {
     const item = state.items.find((todo) => todo.id === id);
+    if (isRecurringTodo(item)) {
+      const previousRecords = item.records;
+      const previousNotifiedRecords = item.notifiedRecords;
+      const previousRecord = todoRecordForDate(item, dateKey) || {};
+      const nextCompleted = previousRecord.completed !== true;
+      const subtaskRecords = { ...(previousRecord.subtasks || {}) };
+      if (nextCompleted) {
+        item.subtasks?.forEach((subtask) => { subtaskRecords[subtask.id] = true; });
+      }
+      item.records = {
+        ...(previousRecords || {}),
+        [dateKey]: {
+          ...previousRecord,
+          completed: nextCompleted,
+          completedAt: nextCompleted ? Date.now() : null,
+          subtasks: subtaskRecords,
+        },
+      };
+      if (previousRecord.completed === true && !nextCompleted && previousNotifiedRecords?.[dateKey]) {
+        item.notifiedRecords = { ...previousNotifiedRecords };
+        delete item.notifiedRecords[dateKey];
+      }
+      return () => {
+        item.records = previousRecords;
+        item.notifiedRecords = previousNotifiedRecords;
+      };
+    }
     const previous = {
       completed: item.completed,
       completedAt: item.completedAt,
@@ -908,16 +1134,19 @@ function toggleTodo(id) {
       item.subtasks?.forEach((subtask, index) => {
         subtask.completed = previous.subtasks[index];
       });
-    };
+      };
   });
+  if (persisted) queueMotionCue("state", id);
   render();
 }
 
 function toggleExpanded(id) {
-  state.expandedIds = state.expandedIds.includes(id)
-    ? state.expandedIds.filter((value) => value !== id)
-    : [...state.expandedIds, id];
-  save();
+  const opening = !state.expandedIds.includes(id);
+  state.expandedIds = opening
+    ? [...state.expandedIds, id]
+    : state.expandedIds.filter((value) => value !== id);
+  scheduleStateSave();
+  if (opening) queueMotionCue("expand", id);
   render();
 }
 
@@ -926,9 +1155,40 @@ function toggleSubtask(itemId, subtaskId) {
     .find((todo) => todo.id === itemId)
     ?.subtasks?.some((entry) => entry.id === subtaskId);
   if (!exists) return;
-  persistMutation(() => {
+  const dateKey = toDateKey();
+  const target = state.items.find((todo) => todo.id === itemId);
+  if (isRecurringTodo(target) && !todoOccursOnDate(target, dateKey)) return;
+  const persisted = persistMutation(() => {
     const item = state.items.find((todo) => todo.id === itemId);
     const subtask = item.subtasks.find((entry) => entry.id === subtaskId);
+    if (isRecurringTodo(item)) {
+      const previousRecords = item.records;
+      const previousNotifiedRecords = item.notifiedRecords;
+      const previousRecord = todoRecordForDate(item, dateKey) || {};
+      const subtaskRecords = { ...(previousRecord.subtasks || {}) };
+      const nextCompleted = subtaskRecords[subtaskId] !== true;
+      if (nextCompleted) subtaskRecords[subtaskId] = true;
+      else delete subtaskRecords[subtaskId];
+      item.records = {
+        ...(previousRecords || {}),
+        [dateKey]: {
+          ...previousRecord,
+          completed: previousRecord.completed === true && nextCompleted,
+          completedAt: previousRecord.completed === true && nextCompleted
+            ? previousRecord.completedAt || Date.now()
+            : null,
+          subtasks: subtaskRecords,
+        },
+      };
+      if (previousRecord.completed === true && !nextCompleted && previousNotifiedRecords?.[dateKey]) {
+        item.notifiedRecords = { ...previousNotifiedRecords };
+        delete item.notifiedRecords[dateKey];
+      }
+      return () => {
+        item.records = previousRecords;
+        item.notifiedRecords = previousNotifiedRecords;
+      };
+    }
     const previous = {
       subtaskCompleted: subtask.completed,
       itemCompleted: item.completed,
@@ -948,6 +1208,7 @@ function toggleSubtask(itemId, subtaskId) {
       item.notified = previous.notified;
     };
   });
+  if (persisted) queueMotionCue("state", itemId, "", subtaskId);
   render();
 }
 
@@ -957,7 +1218,7 @@ function toggleGoalRoutine(goalId, routineId) {
   const dateKey = toDateKey();
   const routine = routinesForDate(goal, dateKey).find((entry) => entry.id === routineId);
   if (!routine) return;
-  persistMutation(() => {
+  const persisted = persistMutation(() => {
     const currentGoal = state.goals.find((entry) => entry.id === goalId);
     const previousRecords = currentGoal.records;
     currentGoal.records = { ...(previousRecords || {}) };
@@ -971,6 +1232,7 @@ function toggleGoalRoutine(goalId, routineId) {
       : `${currentGoal.title}今日已完成 ${progress.completed}/${progress.total}`;
     return () => { currentGoal.records = previousRecords; };
   });
+  if (persisted) queueMotionCue("state", goalId, routineId);
   render();
 }
 
@@ -986,7 +1248,7 @@ function toggleGoalPause(id) {
   const goal = (state.goals || []).find((entry) => entry.id === id);
   if (!goal || goal.status === "completed") return;
   const dateKey = toDateKey();
-  persistMutation(() => {
+  const persisted = persistMutation(() => {
     const currentGoal = state.goals.find((entry) => entry.id === id);
     const previousStatus = currentGoal.status;
     const previousPausePeriods = currentGoal.pausePeriods;
@@ -1004,6 +1266,7 @@ function toggleGoalPause(id) {
       currentGoal.pausePeriods = previousPausePeriods;
     };
   });
+  if (persisted) queueMotionCue("state", id);
   render();
 }
 
@@ -1015,7 +1278,7 @@ function toggleGoalComplete(id) {
     openGoalEditor(id, { reopenOnSave: true });
     return;
   }
-  persistMutation(() => {
+  const persisted = persistMutation(() => {
     const currentGoal = state.goals.find((entry) => entry.id === id);
     const previousStatus = currentGoal.status;
     const previousCompletedAt = currentGoal.completedAt;
@@ -1036,6 +1299,7 @@ function toggleGoalComplete(id) {
       currentGoal.pausePeriods = previousPausePeriods;
     };
   });
+  if (persisted) queueMotionCue("state", id);
   render();
 }
 
@@ -1067,12 +1331,12 @@ async function revealTodo(id) {
   activeMainView = "list";
   if (!state.expandedIds.includes(id)) state.expandedIds.push(id);
   if (compact) await expandWindow();
-  save();
+  scheduleStateSave();
   render();
   requestAnimationFrame(() => {
     const card = [...app.querySelectorAll(".todo-row:not(.goal-row)")]
       .find((element) => element.dataset.id === id);
-    card?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    card?.scrollIntoView({ behavior: preferredScrollBehavior(), block: "nearest" });
     card?.querySelector('.todo-main[data-act="expand"]')?.focus({ preventScroll: true });
   });
 }
@@ -1082,32 +1346,38 @@ async function revealGoal(id) {
   activeMainView = "list";
   if (!state.expandedIds.includes(id)) state.expandedIds.push(id);
   if (compact) await expandWindow();
-  save();
+  scheduleStateSave();
   render();
   requestAnimationFrame(() => {
     const card = [...app.querySelectorAll(".goal-row")]
       .find((element) => element.dataset.id === id);
-    card?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    card?.scrollIntoView({ behavior: preferredScrollBehavior(), block: "nearest" });
     card?.querySelector('.todo-main[data-act="expand"]')?.focus({ preventScroll: true });
   });
 }
 
 function openOverviewTodaySheet() {
   const actions = getOverviewTodayActions();
-  const returnFocus = document.activeElement;
+  const sheetDateKey = toDateKey();
+  const returnFocus = captureFocusDescriptor();
   const overlay = document.createElement("div");
   overlay.className = "overlay overview-sheet-overlay";
+  overlay.dataset.dateKey = sheetDateKey;
   overlay.innerHTML = `<section class="dialog overview-sheet-dialog" role="dialog" aria-modal="true" aria-labelledby="today-sheet-title">
     <div class="dialog-head"><div><h2 id="today-sheet-title">今日行动</h2><p>${actions.length ? `共 ${actions.length} 项，点击正文查看完整详情` : "今天没有待完成事项"}</p></div><button class="icon-btn" data-sheet-close aria-label="关闭">${ICONS.close}</button></div>
     ${actions.length ? `<ul class="overview-action-list sheet-action-list">${actions.map(overviewActionRowHtml).join("")}</ul>` : ""}
   </section>`;
   document.body.appendChild(overlay);
   const close = (restoreFocus = true) => {
-    overlay.remove();
-    if (restoreFocus) returnFocus?.focus?.({ preventScroll: true });
+    dismissOverlay(overlay, restoreFocus ? () => restoreFocusDescriptor(returnFocus) : null);
   };
   overlay.addEventListener("click", async (event) => {
     if (event.target === overlay || event.target.closest("[data-sheet-close]")) return close();
+    if (overlay.dataset.dateKey !== toDateKey()) {
+      close();
+      updateRelativeLabels();
+      return;
+    }
     const target = event.target.closest("[data-act]");
     if (!target) return;
     const { act, id, routineId } = target.dataset;
@@ -1142,11 +1412,14 @@ function openOverviewTodaySheet() {
 }
 
 function openHorizonBucket(bucketKey) {
-  const allEntries = buildFutureHorizonEntries(state.items, state.goals || []);
+  const allEntries = buildFutureHorizonEntries(
+    state.items.filter((item) => !isRecurringTodo(item)),
+    state.goals || [],
+  );
   const buckets = bucketFutureHorizonEntries(allEntries);
   const entries = buckets[bucketKey] || [];
   const labels = { within30Days: "30 天内", within90Days: "31–90 天", beyond90Days: "90 天后" };
-  const returnFocus = document.activeElement;
+  const returnFocus = captureFocusDescriptor();
   const overlay = document.createElement("div");
   overlay.className = "overlay overview-sheet-overlay";
   overlay.innerHTML = `<section class="dialog overview-sheet-dialog" role="dialog" aria-modal="true" aria-labelledby="horizon-sheet-title">
@@ -1158,8 +1431,7 @@ function openHorizonBucket(bucketKey) {
   </section>`;
   document.body.appendChild(overlay);
   const close = (restoreFocus = true) => {
-    overlay.remove();
-    if (restoreFocus) returnFocus?.focus?.({ preventScroll: true });
+    dismissOverlay(overlay, restoreFocus ? () => restoreFocusDescriptor(returnFocus) : null);
   };
   overlay.addEventListener("click", async (event) => {
     if (event.target === overlay || event.target.closest("[data-sheet-close]")) return close();
@@ -1181,18 +1453,18 @@ function toggleTodayActions() {
   const dateKey = toDateKey();
   state.settings.todayActionsCollapsedDate =
     state.settings.todayActionsCollapsedDate === dateKey ? "" : dateKey;
-  save();
+  scheduleStateSave();
   render();
 }
 
 async function revealTodayActions() {
   state.settings.todayActionsCollapsedDate = "";
   if (compact) await expandWindow();
-  save();
+  scheduleStateSave();
   render();
   requestAnimationFrame(() => {
     const board = app.querySelector(".today-actions-board");
-    board?.scrollIntoView({ behavior: "smooth", block: "start" });
+    board?.scrollIntoView({ behavior: preferredScrollBehavior(), block: "start" });
     board?.querySelector(".today-actions-head")?.focus({ preventScroll: true });
   });
 }
@@ -1200,7 +1472,7 @@ async function revealTodayActions() {
 function deleteGoal(id) {
   const goal = (state.goals || []).find((entry) => entry.id === id);
   if (!goal) return;
-  const returnFocus = document.activeElement;
+  const returnFocus = captureFocusDescriptor();
   const overlay = document.createElement("div");
   overlay.className = "overlay";
   overlay.innerHTML = `<section class="dialog confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-goal-title" aria-describedby="confirm-goal-copy">
@@ -1211,8 +1483,7 @@ function deleteGoal(id) {
   </section>`;
   document.body.appendChild(overlay);
   const close = () => {
-    overlay.remove();
-    returnFocus?.focus?.({ preventScroll: true });
+    dismissOverlay(overlay, () => restoreFocusDescriptor(returnFocus));
   };
   overlay.addEventListener("click", (event) => {
     if (event.target === overlay || event.target.closest('[data-confirm-goal="cancel"]')) return close();
@@ -1249,6 +1520,10 @@ app.addEventListener("click", async (event) => {
   }
   const target = event.target.closest("[data-act]");
   if (!target) return;
+  if (lastRenderedDate !== toDateKey()) {
+    updateRelativeLabels();
+    return;
+  }
   const id = target.dataset.id;
   switch (target.dataset.act) {
     case "toggle": toggleTodo(id); break;
@@ -1287,8 +1562,86 @@ const WEEKDAY_OPTIONS = [
   { value: 0, label: "日" },
 ];
 
+function routineScheduleControl(schedule, routineId) {
+  const options = [
+    ["daily", "每天"],
+    ["weekdays", "工作日"],
+    ["custom", "自定义"],
+  ];
+  return `<div class="routine-schedule-options" role="radiogroup" aria-label="重复日期">
+    ${options.map(([value, label]) => `<label>
+      <input type="radio" class="routine-schedule" name="routine-schedule-${esc(routineId)}" value="${value}" ${schedule === value ? "checked" : ""} />
+      <span>${label}</span>
+    </label>`).join("")}
+  </div>`;
+}
+
+function readRoutineSchedule(row) {
+  return row?.querySelector(".routine-schedule:checked")?.value || "daily";
+}
+
+function todoScheduleControl(schedule, itemId = "new") {
+  const options = [
+    ["once", "不重复"],
+    ["daily", "每天"],
+    ["weekdays", "工作日"],
+    ["custom", "自定义"],
+  ];
+  return `<div class="todo-schedule-options" role="radiogroup" aria-label="重复日期">
+    ${options.map(([value, label]) => `<label>
+      <input type="radio" class="todo-schedule" name="todo-schedule-${esc(itemId)}" value="${value}" ${schedule === value ? "checked" : ""} />
+      <span>${label}</span>
+    </label>`).join("")}
+  </div>`;
+}
+
+function readTodoSchedule(root) {
+  return root?.querySelector(".todo-schedule:checked")?.value || "once";
+}
+
+function isRecurringTodo(item) {
+  return !!item && ["daily", "weekdays", "custom"].includes(item.schedule);
+}
+
+function todoRecordForDate(item, dateKey = toDateKey()) {
+  return isRecurringTodo(item) && item.records?.[dateKey] && typeof item.records[dateKey] === "object"
+    ? item.records[dateKey]
+    : null;
+}
+
+function todoCompletedForDate(item, dateKey = toDateKey()) {
+  return isRecurringTodo(item)
+    ? todoRecordForDate(item, dateKey)?.completed === true
+    : item?.completed === true;
+}
+
+function todoSubtaskCompletedForDate(item, subtaskId, dateKey = toDateKey()) {
+  return isRecurringTodo(item)
+    ? todoRecordForDate(item, dateKey)?.subtasks?.[subtaskId] === true
+    : item?.subtasks?.find((subtask) => subtask.id === subtaskId)?.completed === true;
+}
+
+function nextTodoOccurrence(item, dateKey = toDateKey()) {
+  if (!isRecurringTodo(item)) return item?.dueDate || dateKey;
+  let cursor = item.dueDate > dateKey ? item.dueDate : dateKey;
+  for (let offset = 0; offset < 8; offset += 1) {
+    if (todoOccursOnDate(item, cursor)) return cursor;
+    cursor = addDays(cursor, 1);
+  }
+  return item.dueDate || dateKey;
+}
+
+function todoScheduleLabel(item) {
+  if (!isRecurringTodo(item)) return "";
+  if (item.schedule === "daily") return "每天";
+  if (item.schedule === "weekdays") return "工作日";
+  const labels = new Map(WEEKDAY_OPTIONS.map((day) => [day.value, day.label]));
+  const selected = (item.weekdays || []).map((day) => labels.get(day)).filter(Boolean);
+  return selected.length ? `每周${selected.join("、")}` : "自定义重复";
+}
+
 function openCreateMenu() {
-  const returnFocus = document.activeElement;
+  const returnFocus = captureFocusDescriptor();
   const overlay = document.createElement("div");
   overlay.className = "overlay create-overlay";
   overlay.innerHTML = `<section class="dialog create-dialog" role="dialog" aria-modal="true" aria-labelledby="create-title">
@@ -1301,25 +1654,29 @@ function openCreateMenu() {
       </button>
       <button class="create-option goal-option" data-create="goal">
         <span class="create-option-icon">${ICONS.target}</span>
-        <span><strong>阶段目标</strong><small>目标日期与每天重复的行动计划</small></span>
+        <span><strong>阶段目标</strong><small>目标日期，以及每天、工作日或自定义星期的行动</small></span>
         ${ICONS.arrow}
       </button>
     </div>
   </section>`;
   document.body.appendChild(overlay);
 
-  const close = (restoreFocus = true) => {
-    overlay.remove();
-    if (restoreFocus) returnFocus?.focus?.({ preventScroll: true });
+  const close = (restoreFocus = true, animate = true) => {
+    if (!animate) {
+      overlay.remove();
+      if (restoreFocus) restoreFocusDescriptor(returnFocus);
+      return;
+    }
+    dismissOverlay(overlay, restoreFocus ? () => restoreFocusDescriptor(returnFocus) : null);
   };
   overlay.addEventListener("click", (event) => {
     if (event.target === overlay || event.target.closest('[data-create="close"]')) return close();
     const choice = event.target.closest("[data-create]")?.dataset.create;
     if (choice === "todo") {
-      close(false);
+      close(false, false);
       openEditor();
     } else if (choice === "goal") {
-      close(false);
+      close(false, false);
       openGoalEditor();
     }
   });
@@ -1347,22 +1704,24 @@ function routineEditorRowHtml(routine = {}) {
       <input class="routine-title-input" maxlength="120" value="${esc(routine.title || "")}" placeholder="例如：背单词 30 分钟" aria-label="重复行动名称" />
       <button class="routine-remove" data-routine-remove aria-label="移除重复行动">${ICONS.close}</button>
     </div>
-    <div class="routine-config-row">
-      <label><span>重复</span><select class="routine-schedule" aria-label="重复频率">
-        <option value="daily" ${schedule === "daily" ? "selected" : ""}>每天</option>
-        <option value="weekdays" ${schedule === "weekdays" ? "selected" : ""}>工作日</option>
-        <option value="custom" ${schedule === "custom" ? "selected" : ""}>自定义</option>
-      </select></label>
-      <label><span>时间安排</span><select class="routine-time-mode" data-time-mode aria-label="时间安排">${timeModeOptions(timeMode)}</select></label>
+    <div class="routine-schedule-field">
+      <span>重复日期</span>
+      ${routineScheduleControl(schedule, routineId)}
+    </div>
+    <div class="weekday-picker-wrap ${schedule === "custom" ? "" : "hidden"}" data-weekday-picker>
+      <span>选择每周执行日</span>
+      <div class="weekday-picker" role="group" aria-label="选择每周执行日">
+        ${WEEKDAY_OPTIONS.map((day) => `<button type="button" class="${selectedDays.has(day.value) ? "on" : ""}" data-weekday="${day.value}" aria-pressed="${selectedDays.has(day.value)}" aria-label="星期${day.label}">${day.label}</button>`).join("")}
+      </div>
+    </div>
+    <div class="routine-config-row routine-time-config">
+      <label><span>时间安排（可选）</span><select class="routine-time-mode" data-time-mode aria-label="时间安排">${timeModeOptions(timeMode)}</select></label>
     </div>
     <div class="routine-time-fields time-fields ${timeMode === "none" ? "hidden" : ""} ${timeMode === "point" ? "point" : ""}" data-time-fields>
       <label><span data-time-start-label>${timeMode === "range" ? "开始时间" : "时间点"}</span><input class="routine-time" data-time-start type="time" value="${esc(routine.time || "")}" ${timeMode === "none" ? "disabled" : ""} aria-describedby="${esc(timeErrorId)}" /></label>
       <label class="${timeMode === "range" ? "" : "hidden"}" data-time-end-field><span>结束时间</span><input class="routine-end-time" data-time-end type="time" value="${esc(routine.endTime || "")}" ${timeMode === "range" ? "" : "disabled"} aria-describedby="${esc(timeErrorId)}" /></label>
     </div>
     <p id="${esc(timeErrorId)}" class="time-editor-error hidden" data-time-error role="alert"></p>
-    <div class="weekday-picker ${schedule === "custom" ? "" : "hidden"}" data-weekday-picker aria-label="选择重复星期">
-      ${WEEKDAY_OPTIONS.map((day) => `<button type="button" class="${selectedDays.has(day.value) ? "on" : ""}" data-weekday="${day.value}" aria-pressed="${selectedDays.has(day.value)}">${day.label}</button>`).join("")}
-    </div>
   </div>`;
 }
 
@@ -1453,7 +1812,7 @@ function openGoalEditor(id = null, options = {}) {
   };
   const today = toDateKey();
   const editableRoutines = (values.routines || []).filter((routine) => !routine.endDate || routine.endDate >= today);
-  const returnFocus = document.activeElement;
+  const returnFocus = captureFocusDescriptor();
   const overlay = document.createElement("div");
   overlay.className = "overlay";
   overlay.innerHTML = `<section class="dialog goal-editor-dialog" role="dialog" aria-modal="true" aria-labelledby="goal-editor-title">
@@ -1474,8 +1833,7 @@ function openGoalEditor(id = null, options = {}) {
   document.body.appendChild(overlay);
 
   const close = () => {
-    overlay.remove();
-    returnFocus?.focus?.({ preventScroll: true });
+    dismissOverlay(overlay, () => restoreFocusDescriptor(returnFocus));
   };
   const routineList = overlay.querySelector("#routine-editor-list");
   const addRoutine = () => {
@@ -1488,7 +1846,7 @@ function openGoalEditor(id = null, options = {}) {
     const row = event.target.closest("[data-routine-row]");
     if (event.target.matches(".routine-schedule")) {
       const picker = row.querySelector("[data-weekday-picker]");
-      picker.classList.toggle("hidden", event.target.value !== "custom");
+      picker.classList.toggle("hidden", readRoutineSchedule(row) !== "custom");
     } else if (event.target.matches("[data-time-mode]")) {
       syncTimeEditor(row);
     }
@@ -1535,7 +1893,7 @@ function openGoalEditor(id = null, options = {}) {
     const routineRows = [...overlay.querySelectorAll("[data-routine-row]")]
       .filter((row) => row.querySelector(".routine-title-input").value.trim());
     const invalidCustom = routineRows.find((row) =>
-      row.querySelector(".routine-schedule").value === "custom" &&
+      readRoutineSchedule(row) === "custom" &&
       !row.querySelector("[data-weekday].on")
     );
     if (invalidCustom) {
@@ -1555,7 +1913,7 @@ function openGoalEditor(id = null, options = {}) {
       title: row.querySelector(".routine-title-input").value.trim(),
       time: result.startTime,
       endTime: result.endTime,
-      schedule: row.querySelector(".routine-schedule").value,
+      schedule: readRoutineSchedule(row),
       weekdays: [...row.querySelectorAll("[data-weekday].on")].map((button) => Number(button.dataset.weekday)),
     }));
     const next = {
@@ -1563,7 +1921,10 @@ function openGoalEditor(id = null, options = {}) {
       targetDate,
       detail: overlay.querySelector("#goal-detail").value.trim(),
     };
-    const previousState = cloneState();
+    const goalIndex = goal ? state.goals.findIndex((entry) => entry.id === goal.id) : -1;
+    const previousGoal = goal ? cloneValue(goal) : null;
+    const previousExpandedIds = [...state.expandedIds];
+    let createdGoalId = "";
     if (goal) {
       const mergedRoutines = mergeGoalRoutines(goal, routines);
       Object.assign(goal, next, { routines: mergedRoutines });
@@ -1590,10 +1951,16 @@ function openGoalEditor(id = null, options = {}) {
       state.goals ||= [];
       state.goals.push(newGoal);
       state.expandedIds.push(newGoal.id);
+      createdGoalId = newGoal.id;
     }
     if (!save()) {
-      state = previousState;
-      goal = id ? state.goals.find((entry) => entry.id === id) : null;
+      state.expandedIds = previousExpandedIds;
+      if (goalIndex >= 0 && previousGoal) {
+        state.goals[goalIndex] = previousGoal;
+        goal = previousGoal;
+      } else if (createdGoalId) {
+        state.goals = state.goals.filter((entry) => entry.id !== createdGoalId);
+      }
       showPersistenceError(overlay);
       return;
     }
@@ -1631,17 +1998,37 @@ function openEditor(id = null) {
     dueDate: toDateKey(),
     dueTime: "",
     dueEndTime: "",
+    schedule: "once",
+    weekdays: [],
   };
   const todoTimeMode = timeModeFor(values.dueTime, values.dueEndTime);
-  const returnFocus = document.activeElement;
+  const todoSchedule = ["once", "daily", "weekdays", "custom"].includes(values.schedule)
+    ? values.schedule
+    : "once";
+  const selectedDays = new Set(
+    todoSchedule === "custom" && Array.isArray(values.weekdays) && values.weekdays.length
+      ? values.weekdays
+      : [1, 2, 3, 4, 5]
+  );
+  const returnFocus = captureFocusDescriptor();
   const overlay = document.createElement("div");
   overlay.className = "overlay";
   overlay.innerHTML = `<section class="dialog editor-dialog" role="dialog" aria-modal="true" aria-labelledby="editor-title">
     <div class="dialog-head"><div><h2 id="editor-title">${item ? "编辑待办" : "新建待办"}</h2><p>安排日期与时间，列表会自动排序</p></div><button class="icon-btn" data-dialog="close" aria-label="关闭">${ICONS.close}</button></div>
     <label class="field"><span>待办标题</span><input id="edit-title" maxlength="120" value="${esc(values.title)}" placeholder="要完成什么？" required /></label>
+    <div class="todo-schedule-field">
+      <span>重复日期</span>
+      ${todoScheduleControl(todoSchedule, values.id || "new")}
+    </div>
+    <div class="todo-weekday-picker ${todoSchedule === "custom" ? "" : "hidden"}" data-todo-weekday-picker>
+      <span>选择每周执行日</span>
+      <div class="weekday-picker" role="group" aria-label="选择每周执行日">
+        ${WEEKDAY_OPTIONS.map((day) => `<button type="button" class="${selectedDays.has(day.value) ? "on" : ""}" data-todo-weekday="${day.value}" aria-pressed="${selectedDays.has(day.value)}" aria-label="星期${day.label}">${day.label}</button>`).join("")}
+      </div>
+    </div>
     <div class="todo-time-editor" data-time-scope>
       <div class="field-grid">
-      <label class="field"><span>日期</span><input id="edit-date" type="date" value="${esc(values.dueDate)}" required /></label>
+      <label class="field"><span data-todo-date-label>${todoSchedule === "once" ? "日期" : "开始日期"}</span><input id="edit-date" type="date" value="${esc(values.dueDate)}" required /></label>
       <label class="field"><span>时间安排</span><select id="edit-time-mode" data-time-mode>${timeModeOptions(todoTimeMode)}</select></label>
       </div>
       <div class="time-fields field-grid ${todoTimeMode === "none" ? "hidden" : ""} ${todoTimeMode === "point" ? "point" : ""}" data-time-fields>
@@ -1664,11 +2051,17 @@ function openEditor(id = null) {
   document.body.appendChild(overlay);
 
   const close = () => {
-    overlay.remove();
-    returnFocus?.focus?.({ preventScroll: true });
+    dismissOverlay(overlay, () => restoreFocusDescriptor(returnFocus));
   };
   overlay.addEventListener("click", (event) => {
     if (event.target === overlay || event.target.closest('[data-dialog="close"]')) return close();
+    const weekday = event.target.closest("[data-todo-weekday]");
+    if (weekday) {
+      const selected = !weekday.classList.contains("on");
+      weekday.classList.toggle("on", selected);
+      weekday.setAttribute("aria-pressed", String(selected));
+      return;
+    }
     if (event.target.closest("[data-subtask-add]")) {
       const list = overlay.querySelector("#subtask-editor-list");
       list.querySelector(".subtask-editor-empty")?.remove();
@@ -1694,6 +2087,16 @@ function openEditor(id = null) {
       setTimeout(() => overlay.querySelector(".dialog")?.classList.remove("shake"), 300);
       return;
     }
+    const schedule = readTodoSchedule(overlay);
+    const weekdays = [...overlay.querySelectorAll("[data-todo-weekday].on")]
+      .map((button) => Number(button.dataset.todoWeekday))
+      .sort((a, b) => a - b);
+    if (schedule === "custom" && !weekdays.length) {
+      overlay.querySelector("[data-todo-weekday]")?.focus();
+      overlay.querySelector(".todo-schedule-field")?.classList.add("shake");
+      setTimeout(() => overlay.querySelector(".todo-schedule-field")?.classList.remove("shake"), 300);
+      return;
+    }
     const timeResult = readTimeEditor(overlay.querySelector("[data-time-scope]"));
     if (timeResult.message) {
       showTimeEditorError(overlay.querySelector("[data-time-scope]"), timeResult);
@@ -1704,6 +2107,8 @@ function openEditor(id = null) {
       dueDate,
       dueTime: timeResult.startTime,
       dueEndTime: timeResult.endTime,
+      schedule,
+      weekdays: schedule === "custom" ? weekdays : [],
       detail: overlay.querySelector("#edit-detail").value.trim(),
       subtasks: [...overlay.querySelectorAll("[data-subtask-row]")]
         .map((row) => ({
@@ -1713,14 +2118,51 @@ function openEditor(id = null) {
         }))
         .filter((subtask) => subtask.title),
     };
-    const previousState = cloneState();
+    const itemIndex = item ? state.items.findIndex((todo) => todo.id === item.id) : -1;
+    const previousItem = item ? cloneValue(item) : null;
+    const previousExpandedIds = [...state.expandedIds];
     let persisted = false;
     if (item) {
-      const reminderTriggerChanged = item.dueDate !== next.dueDate || item.dueTime !== next.dueTime;
-      Object.assign(item, next, { notified: reminderTriggerChanged ? false : item.notified });
-      if (item.completed && item.subtasks.some((subtask) => !subtask.completed)) {
+      const previousSchedule = item.schedule || "once";
+      const scheduleChanged = previousSchedule !== next.schedule ||
+        JSON.stringify(item.weekdays || []) !== JSON.stringify(next.weekdays || []);
+      const reminderTriggerChanged = scheduleChanged || item.dueDate !== next.dueDate || item.dueTime !== next.dueTime;
+      Object.assign(item, next);
+      if (next.schedule === "once") {
+        if (previousSchedule !== "once") {
+          item.completed = false;
+          item.completedAt = null;
+        }
+        item.notified = reminderTriggerChanged ? false : item.notified;
+      } else {
         item.completed = false;
         item.completedAt = null;
+        item.notified = false;
+        item.records ||= {};
+        item.notifiedRecords ||= {};
+        const validSubtaskIds = new Set(item.subtasks.map((subtask) => subtask.id));
+        for (const record of Object.values(item.records)) {
+          if (!record || typeof record !== "object") continue;
+          record.subtasks = Object.fromEntries(
+            Object.entries(record.subtasks || {})
+              .filter(([subtaskId, completed]) => validSubtaskIds.has(subtaskId) && completed === true),
+          );
+        }
+        const todayRecord = todoRecordForDate(item, toDateKey());
+        if (
+          todayRecord?.completed === true &&
+          item.subtasks.some((subtask) => todayRecord.subtasks?.[subtask.id] !== true)
+        ) {
+          todayRecord.completed = false;
+          todayRecord.completedAt = null;
+          delete item.notifiedRecords[toDateKey()];
+        }
+        if (reminderTriggerChanged) delete item.notifiedRecords[toDateKey()];
+      }
+      if (next.schedule === "once" && item.completed && item.subtasks.some((subtask) => !subtask.completed)) {
+        item.completed = false;
+        item.completedAt = null;
+        item.notified = false;
       }
       if (!state.expandedIds.includes(item.id)) state.expandedIds.push(item.id);
       persisted = save();
@@ -1728,8 +2170,11 @@ function openEditor(id = null) {
       persisted = addTodo(next);
     }
     if (!persisted) {
-      state = previousState;
-      item = id ? state.items.find((todo) => todo.id === id) : null;
+      state.expandedIds = previousExpandedIds;
+      if (itemIndex >= 0 && previousItem) {
+        state.items[itemIndex] = previousItem;
+        item = previousItem;
+      }
       showPersistenceError(overlay);
       return;
     }
@@ -1758,9 +2203,18 @@ function openEditor(id = null) {
     }
   });
   overlay.addEventListener("change", (event) => {
-    if (!event.target.matches("[data-time-mode]")) return;
-    const editor = event.target.closest("[data-time-scope]");
-    syncTimeEditor(editor);
+    if (event.target.matches(".todo-schedule")) {
+      const schedule = readTodoSchedule(overlay);
+      overlay.querySelector("[data-todo-weekday-picker]")
+        ?.classList.toggle("hidden", schedule !== "custom");
+      const dateLabel = overlay.querySelector("[data-todo-date-label]");
+      if (dateLabel) dateLabel.textContent = schedule === "once" ? "日期" : "开始日期";
+      return;
+    }
+    if (event.target.matches("[data-time-mode]")) {
+      const editor = event.target.closest("[data-time-scope]");
+      syncTimeEditor(editor);
+    }
   });
   overlay.querySelector("#edit-title")?.focus();
 }
@@ -1792,6 +2246,7 @@ async function openExternal(url) {
 function openSettings() {
   const settings = state.settings;
   let persistedOpacity = settings.opacity;
+  const returnFocus = captureFocusDescriptor();
   const overlay = document.createElement("div");
   overlay.className = "overlay";
   overlay.innerHTML = `<section class="dialog settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title">
@@ -1809,9 +2264,10 @@ function openSettings() {
     <p class="settings-tip">快捷键 <b>${navigator.platform.includes("Mac") ? "⌘⇧Space" : "Ctrl+Shift+Space"}</b> 可随时唤起。开启鼠标穿透后，可从系统托盘菜单关闭。</p>
   </section>`;
   document.body.appendChild(overlay);
+  const close = () => dismissOverlay(overlay, () => restoreFocusDescriptor(returnFocus));
 
   overlay.addEventListener("click", async (event) => {
-    if (event.target === overlay || event.target.closest('[data-setting="close"]')) return overlay.remove();
+    if (event.target === overlay || event.target.closest('[data-setting="close"]')) return close();
     const theme = event.target.closest("[data-theme-value]");
     if (theme) {
       const previousAppearance = settings.appearance;
@@ -1863,9 +2319,10 @@ function openSettings() {
   overlay.querySelector("#opacity-range")?.addEventListener("input", (event) => {
     settings.opacity = Number(event.target.value);
     overlay.querySelector(".range-label em").textContent = `${Math.round(settings.opacity * 100)}%`;
-    applyAppearance();
+    scheduleAppearanceUpdate();
   });
   overlay.querySelector("#opacity-range")?.addEventListener("change", (event) => {
+    flushAppearanceUpdate();
     if (save()) {
       persistedOpacity = settings.opacity;
       clearPersistenceError(overlay);
@@ -1887,8 +2344,9 @@ function openSettings() {
   })();
 
   overlay.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") overlay.remove();
+    if (event.key === "Escape") close();
   });
+  overlay.querySelector('[data-setting="close"]')?.focus();
 }
 
 async function toggleAutostart(button, overlay) {
@@ -1971,8 +2429,18 @@ async function runReminderCheck() {
   const dateKey = toDateKey(now);
   const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
   const dueTodos = state.items.filter((item) => {
-    if (item.completed || item.notified || !item.dueTime) return false;
-    const timestamp = dueTimestamp(item);
+    if (!item.dueTime) return false;
+    if (isRecurringTodo(item)) {
+      if (
+        !todoOccursOnDate(item, dateKey) ||
+        todoCompletedForDate(item, dateKey) ||
+        item.notifiedRecords?.[dateKey] === true
+      ) return false;
+    } else if (item.completed || item.notified) return false;
+    const timestamp = dueTimestamp({
+      dueDate: isRecurringTodo(item) ? dateKey : item.dueDate,
+      dueTime: item.dueTime || "",
+    });
     return timestamp <= nowTimestamp && timestamp >= startOfToday;
   });
   const dueRoutines = [];
@@ -1999,7 +2467,10 @@ async function runReminderCheck() {
         title: "悬浮待办 · 到点提醒",
         body: `${timeRangeLabel(item.dueTime, item.dueEndTime)}　${item.title}`,
       }));
-      item.notified = true;
+      if (isRecurringTodo(item)) {
+        item.notifiedRecords ||= {};
+        item.notifiedRecords[dateKey] = true;
+      } else item.notified = true;
       changed = true;
     } catch (_) {}
   }
@@ -2231,7 +2702,9 @@ async function initializeApp() {
 }
 
 window.addEventListener("beforeunload", () => {
+  flushStateSave();
   flushWindowState();
+  if (appearanceFrame !== null) cancelAnimationFrame(appearanceFrame);
   if (maintenanceTimer !== null) clearInterval(maintenanceTimer);
   windowEventUnlisteners.splice(0).forEach((unlisten) => unlisten());
 }, { once: true });

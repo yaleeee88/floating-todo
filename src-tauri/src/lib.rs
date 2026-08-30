@@ -5,14 +5,56 @@ use tauri::{
 };
 use tauri_plugin_dialog::DialogExt;
 
+/// 告知 WebView2 当前窗口是否处于后台，以便它主动回收可释放的内存。
+/// Low 不会暂停 JavaScript，因此隐藏后提醒和定时逻辑仍会继续运行。
+#[cfg(target_os = "windows")]
+fn set_webview_memory_usage(window: &tauri::WebviewWindow, low: bool) {
+    let _ = window.with_webview(move |webview| {
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
+            COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
+        };
+        use windows_core::Interface;
+
+        let level = if low {
+            COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW
+        } else {
+            COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL
+        };
+
+        // 较旧的 WebView2 Runtime 可能没有 ICoreWebView2_19；这种情况下保留默认策略。
+        let _ = (|| -> windows_core::Result<()> {
+            let core_webview = unsafe { webview.controller().CoreWebView2()? };
+            let core_webview_19: ICoreWebView2_19 = core_webview.cast()?;
+            unsafe { core_webview_19.SetMemoryUsageTargetLevel(level) }
+        })();
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_webview_memory_usage(_window: &tauri::WebviewWindow, _low: bool) {}
+
+fn hide_window(window: &tauri::WebviewWindow) {
+    let _ = window.hide();
+    set_webview_memory_usage(window, true);
+}
+
+fn show_window(window: &tauri::WebviewWindow, focus: bool) {
+    // 先恢复 Normal，再显示，避免首帧仍处于后台内存策略。
+    set_webview_memory_usage(window, false);
+    let _ = window.show();
+    if focus {
+        let _ = window.set_focus();
+    }
+}
+
 /// 显示或隐藏悬浮窗。
 fn toggle_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         if window.is_visible().unwrap_or(false) {
-            let _ = window.hide();
+            hide_window(&window);
         } else {
-            let _ = window.show();
-            let _ = window.set_focus();
+            show_window(&window, true);
         }
     }
 }
@@ -88,8 +130,7 @@ pub fn run() {
                     move |_app, _shortcut, event| {
                         if event.state == ShortcutState::Pressed {
                             if let Some(win) = handle.get_webview_window("main") {
-                                let _ = win.show();
-                                let _ = win.set_focus();
+                                show_window(&win, true);
                                 let _ = win.emit("quick-capture", ());
                             }
                         }
@@ -113,7 +154,7 @@ pub fn run() {
                     "toggle" => toggle_window(app),
                     "passthrough" => {
                         if let Some(win) = app.get_webview_window("main") {
-                            let _ = win.show();
+                            show_window(&win, false);
                             let _ = win.emit("toggle-passthrough", ());
                         }
                     }

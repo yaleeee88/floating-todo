@@ -1009,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "floating-todo"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1020,6 +1020,8 @@ dependencies = [
  "tauri-plugin-global-shortcut",
  "tauri-plugin-notification",
  "tauri-plugin-opener",
+ "webview2-com",
+ "windows-core 0.61.2",
 ]
 
 [[package]]

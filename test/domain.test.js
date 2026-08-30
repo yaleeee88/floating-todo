@@ -14,6 +14,7 @@ import {
   routineOccursOnDate,
   routinesForDate,
   sortTodos,
+  todoOccursOnDate,
 } from "../src/domain.js";
 
 const NOW = new Date(2026, 7, 30, 12, 0, 0);
@@ -142,6 +143,132 @@ test("普通待办迁移时规范化时间点与同日时间段", () => {
   assert.deepEqual(migrateSnapshot(migrated, NOW), migrated);
 });
 
+test("普通待办迁移时补齐重复规则并规范化逐日记录", () => {
+  const migrated = migrateSnapshot({
+    version: 5,
+    items: [
+      {
+        id: "legacy",
+        title: "旧的一次性事项",
+        dueDate: "2026-08-31",
+        completed: true,
+        completedAt: 123,
+        notified: true,
+      },
+      {
+        id: "custom",
+        title: "自定义日期",
+        dueDate: "2026-08-30",
+        schedule: "custom",
+        weekdays: [6, 0, 2, 6, 7, "1", -1],
+        subtasks: [
+          { id: "read", title: "阅读", completed: false },
+          { id: "write", title: "写作", completed: false },
+        ],
+        records: {
+          "2026-08-30": {
+            completed: true,
+            completedAt: 456,
+            subtasks: { read: true, write: false, removed: true },
+          },
+          "2026-09-01": {
+            completed: false,
+            completedAt: 789,
+            subtasks: { write: true },
+          },
+          invalid: { completed: true, completedAt: 999, subtasks: { read: true } },
+          "2026-09-06": true,
+        },
+        notifiedRecords: {
+          "2026-08-30": true,
+          "2026-09-01": false,
+          invalid: true,
+        },
+      },
+      {
+        id: "invalid",
+        title: "非法规则",
+        dueDate: "2026-09-01",
+        schedule: "weekly",
+        weekdays: [2],
+        records: [],
+        notifiedRecords: [],
+      },
+    ],
+  }, NOW);
+
+  assert.deepEqual(
+    migrated.items.map(({ schedule, weekdays }) => ({ schedule, weekdays })),
+    [
+      { schedule: "once", weekdays: [] },
+      { schedule: "custom", weekdays: [0, 2, 6] },
+      { schedule: "once", weekdays: [] },
+    ],
+  );
+  assert.equal(migrated.items[0].completed, true);
+  assert.equal(migrated.items[0].completedAt, 123);
+  assert.equal(migrated.items[0].notified, true);
+  assert.deepEqual(migrated.items[0].records, {});
+  assert.deepEqual(migrated.items[0].notifiedRecords, {});
+  assert.deepEqual(migrated.items[1].records, {
+    "2026-08-30": {
+      completed: true,
+      completedAt: 456,
+      subtasks: { read: true },
+    },
+    "2026-09-01": {
+      completed: false,
+      completedAt: null,
+      subtasks: { write: true },
+    },
+  });
+  assert.deepEqual(migrated.items[1].notifiedRecords, { "2026-08-30": true });
+  assert.deepEqual(migrateSnapshot(migrated, NOW), migrated);
+});
+
+test("普通待办迁移时会补齐空 id 并修复重复 id", () => {
+  const migrated = migrateSnapshot({
+    version: 6,
+    items: [
+      { title: "缺少 id", dueDate: "2026-08-30" },
+      { id: "same", title: "第一条", dueDate: "2026-08-30" },
+      { id: "same", title: "第二条", dueDate: "2026-08-31" },
+      { id: "  kept  ", title: "会去除空格", dueDate: "2026-09-01" },
+    ],
+  }, NOW);
+
+  assert.deepEqual(migrated.items.map((item) => item.id), ["todo-0", "same", "todo-2", "kept"]);
+  assert.equal(new Set(migrated.items.map((item) => item.id)).size, 4);
+  assert.deepEqual(migrateSnapshot(migrated, NOW), migrated);
+});
+
+test("普通待办支持一次、每天、工作日和自定义星期", () => {
+  const base = { dueDate: "2026-08-30" };
+
+  assert.equal(todoOccursOnDate({ ...base, schedule: "once" }, "2026-08-29"), false);
+  assert.equal(todoOccursOnDate({ ...base, schedule: "once" }, "2026-08-30"), true);
+  assert.equal(todoOccursOnDate({ ...base, schedule: "once" }, "2026-08-31"), false);
+  assert.equal(todoOccursOnDate({ ...base }, "2026-08-30"), true);
+  assert.equal(todoOccursOnDate({ ...base }, "2026-08-31"), false);
+
+  assert.equal(todoOccursOnDate({ ...base, schedule: "daily" }, "2026-08-29"), false);
+  assert.equal(todoOccursOnDate({ ...base, schedule: "daily" }, "2026-08-30"), true);
+  assert.equal(todoOccursOnDate({ ...base, schedule: "daily" }, "2026-09-01"), true);
+
+  assert.equal(todoOccursOnDate({ ...base, schedule: "weekdays" }, "2026-08-30"), false);
+  assert.equal(todoOccursOnDate({ ...base, schedule: "weekdays" }, "2026-08-31"), true);
+  assert.equal(todoOccursOnDate({ ...base, schedule: "weekdays" }, "2026-09-05"), false);
+
+  const custom = { ...base, schedule: "custom", weekdays: [0, 2, 0, 8] };
+  assert.equal(todoOccursOnDate(custom, "2026-08-30"), true);
+  assert.equal(todoOccursOnDate(custom, "2026-08-31"), false);
+  assert.equal(todoOccursOnDate(custom, "2026-09-01"), true);
+  assert.equal(todoOccursOnDate({ ...custom, dueDate: "2026-09-01" }, "2026-08-30"), false);
+  assert.equal(todoOccursOnDate({ ...custom, weekdays: [] }, "2026-09-01"), false);
+  assert.equal(todoOccursOnDate(custom, "2026-02-30"), false);
+  assert.equal(todoOccursOnDate({ ...custom, dueDate: "invalid" }, "2026-09-01"), false);
+});
+
 test("迁移 v0.3 的三日数据", () => {
   const migrated = migrateSnapshot({
     itemsByDay: {
@@ -152,7 +279,7 @@ test("迁移 v0.3 的三日数据", () => {
     settings: { opacity: 0.7 },
   }, NOW);
 
-  assert.equal(migrated.version, 5);
+  assert.equal(migrated.version, 6);
   assert.deepEqual(migrated.goals, []);
   assert.deepEqual(migrated.items.map((item) => item.dueDate), ["2026-08-30", "2026-08-31"]);
   assert.deepEqual(
@@ -165,6 +292,62 @@ test("迁移 v0.3 的三日数据", () => {
   assert.deepEqual(migrated.items.map((item) => item.subtasks), [[], []]);
   assert.equal(migrated.settings.opacity, 0.7);
   assert.equal(migrated.settings.alwaysOnTop, true);
+});
+
+test("旧版每日常驻待办迁移为每天重复并保留当天状态", () => {
+  const migrated = migrateSnapshot({
+    recurringItems: [
+      { id: "habit", title: "拉伸", time: "07:30", completed: true, notified: true, createdAt: 100 },
+    ],
+  }, NOW);
+  const [item] = migrated.items;
+
+  assert.equal(item.title, "拉伸");
+  assert.equal(item.detail, "");
+  assert.equal(item.schedule, "daily");
+  assert.deepEqual(item.weekdays, []);
+  assert.equal(item.completed, false);
+  assert.equal(item.notified, false);
+  assert.equal(item.records["2026-08-30"].completed, true);
+  assert.equal(typeof item.records["2026-08-30"].completedAt, "number");
+  assert.deepEqual(item.records["2026-08-30"].subtasks, {});
+  assert.deepEqual(item.notifiedRecords, { "2026-08-30": true });
+  assert.equal(todoOccursOnDate(item, "2026-08-31"), true);
+  assert.deepEqual(migrateSnapshot(migrated, NOW), migrated);
+});
+
+test("经 v0.5 中转的旧版每日待办会在 v6 恢复为每天重复", () => {
+  const migrated = migrateSnapshot({
+    version: 5,
+    items: [{
+      id: "legacy-v5-habit",
+      title: "每日 · 复习单词",
+      detail: "自定义过的说明",
+      dueDate: "2026-08-29",
+      dueTime: "07:30",
+      completed: true,
+      completedAt: 123456,
+      notified: true,
+      subtasks: [{ id: "words", title: "20 个单词", completed: true }],
+      createdAt: 100,
+    }],
+  }, NOW);
+  const [item] = migrated.items;
+
+  assert.equal(migrated.version, 6);
+  assert.equal(item.title, "复习单词");
+  assert.equal(item.detail, "自定义过的说明");
+  assert.equal(item.schedule, "daily");
+  assert.equal(item.completed, false);
+  assert.equal(item.notified, false);
+  assert.deepEqual(item.records["2026-08-29"], {
+    completed: true,
+    completedAt: 123456,
+    subtasks: { words: true },
+  });
+  assert.deepEqual(item.notifiedRecords, { "2026-08-29": true });
+  assert.equal(todoOccursOnDate(item, "2026-08-30"), true);
+  assert.deepEqual(migrateSnapshot(migrated, NOW), migrated);
 });
 
 test("迁移并规范化多条子待办", () => {
@@ -188,7 +371,7 @@ test("迁移并规范化多条子待办", () => {
   };
 
   const migrated = migrateSnapshot(source, NOW);
-  assert.equal(migrated.version, 5);
+  assert.equal(migrated.version, 6);
   assert.deepEqual(migrated.items[0].subtasks, [
     { id: "step", title: "确认数据", completed: true },
     { id: "subtask-parent-1", title: "补充风险说明", completed: false },
@@ -280,7 +463,7 @@ test("迁移并规范化阶段目标、重复行动和完成记录", () => {
     ],
   }, NOW);
 
-  assert.equal(migrated.version, 5);
+  assert.equal(migrated.version, 6);
   assert.equal(migrated.goals.length, 2);
   assert.deepEqual(migrated.goals[0], {
     id: "exam",

@@ -20,12 +20,15 @@ import {
   normalizeWindowState,
   WINDOW_LIMITS,
 } from "./window-state.js";
+import { createBackupPayload, parseBackupPayload } from "./backup.js";
 
 const TAURI = window.__TAURI__;
 const appWindow = TAURI?.window?.getCurrentWindow?.();
 const reducedMotionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
 const STORAGE_KEY = "floating-todo/snapshot";
 const WINDOW_STATE_KEY = "floating-todo/window-state-v1";
+const MEMO_STORAGE_KEY = "floating-todo/memo-v1";
+const MEMO_WINDOW_STATE_KEY = "floating-todo/memo-window-state-v1";
 const WINDOW_STATE_SAVE_DELAY = 220;
 const COMPACT_ENTER_WIDTH = 300;
 const COMPACT_ENTER_HEIGHT = 260;
@@ -60,6 +63,14 @@ function readWindowState() {
   }
 }
 
+function readMemoHasContent() {
+  try {
+    return (localStorage.getItem(MEMO_STORAGE_KEY) || "").trim().length > 0;
+  } catch (_) {
+    return false;
+  }
+}
+
 let state = readSnapshot();
 let rememberedWindowState = readWindowState();
 let compact = rememberedWindowState?.compact === true;
@@ -77,6 +88,9 @@ let activeMainView = "overview";
 let overviewWidthTier = getOverviewWidthTier();
 let lastRenderedMainView = null;
 let pendingMotionCue = null;
+let memoWindowOpen = false;
+let memoHasContent = readMemoHasContent();
+let browserMemoWindow = null;
 const viewScrollTop = { overview: 0, list: 0 };
 
 function getOverviewWidthTier(width = window.innerWidth) {
@@ -356,6 +370,7 @@ const ICONS = {
   edit: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
   trash: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4h8v2M19 6l-1 15H6L5 6M10 11v6M14 11v6"/></svg>',
   gear: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1-2.9 2.9-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21h-4v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1-2.9-2.9.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3v-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.8l-.1-.1 2.9-2.9.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.5V3h4v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1 2.9 2.9-.1.1a1.7 1.7 0 0 0-.3 1.8 1.7 1.7 0 0 0 1.5 1h.1v4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>',
+  memoPlus: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 3.5h7.7l3.8 3.8v13.2H6.5z"/><path d="M14 3.5v4h4M9.5 13h5M12 10.5v5"/></svg>',
   empty: '<svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="4" y="3" width="16" height="18" rx="3"/><path d="m8 12 2.4 2.4L16 9M8 6.5h8"/></svg>',
   close: '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2.2"><path d="m6 6 12 12M18 6 6 18"/></svg>',
   download: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14"/></svg>',
@@ -1012,6 +1027,7 @@ function render() {
       ${overview ? "" : `<div class="app-symbol">${ICONS.reminders}</div>`}
       <div class="titles"><h1>${overview ? "时间地平线" : "完整清单"}</h1><p aria-live="polite">${esc(subtitle)}</p></div>
       <div class="spacer"></div>
+      <button class="icon-btn memo-entry ${memoWindowOpen ? "is-open" : ""} ${memoHasContent && !memoWindowOpen ? "has-content" : ""}" data-act="memo" title="${memoWindowOpen ? "聚焦备忘录" : memoHasContent ? "打开备忘录" : "新建备忘录"}" aria-label="新建或打开备忘录" aria-pressed="${memoWindowOpen}">${ICONS.memoPlus}</button>
       <button class="icon-btn" data-act="settings" title="设置" aria-label="设置">${ICONS.gear}</button>
     </header>
 
@@ -1043,6 +1059,51 @@ app.addEventListener("mousedown", (event) => {
     appWindow?.startDragging().catch(() => {});
   }
 });
+
+function updateMemoEntryState() {
+  const button = app.querySelector('[data-act="memo"]');
+  if (!button) return;
+  button.classList.toggle("is-open", memoWindowOpen);
+  button.classList.toggle("has-content", memoHasContent && !memoWindowOpen);
+  button.setAttribute("aria-pressed", String(memoWindowOpen));
+  button.title = memoWindowOpen
+    ? "聚焦备忘录"
+    : memoHasContent
+      ? "打开备忘录"
+      : "新建备忘录";
+}
+
+function syncMemoState(payload = {}) {
+  memoHasContent = typeof payload.hasContent === "boolean"
+    ? payload.hasContent
+    : readMemoHasContent();
+  if (typeof payload.open === "boolean") memoWindowOpen = payload.open;
+  updateMemoEntryState();
+}
+
+async function openMemoWindow() {
+  try {
+    if (TAURI?.core?.invoke) {
+      await TAURI.core.invoke("open_memo_window");
+    } else {
+      if (!browserMemoWindow || browserMemoWindow.closed) {
+        browserMemoWindow = window.open(
+          "memo.html",
+          "floating-todo-memo",
+          "popup,width=338,height=210",
+        );
+      }
+      if (!browserMemoWindow) throw new Error("Memo popup was blocked");
+      browserMemoWindow.focus();
+    }
+    memoWindowOpen = true;
+    updateMemoEntryState();
+  } catch (error) {
+    console.error("Unable to open the memo window", error);
+    statusAnnouncement = "暂时无法打开备忘录";
+    render();
+  }
+}
 
 function addTodo(data) {
   const title = data.title.trim();
@@ -1546,6 +1607,7 @@ app.addEventListener("click", async (event) => {
     case "edit": openEditor(id); break;
     case "delete": deleteTodo(id); break;
     case "new-menu": openCreateMenu(); break;
+    case "memo": await openMemoWindow(); break;
     case "settings": openSettings(); break;
     case "completed-overflow": showAllCompleted = !showAllCompleted; render(); break;
     case "grow": if (await expandWindow()) render(); break;
@@ -2387,9 +2449,34 @@ async function ensureAutostart() {
   } catch (_) {}
 }
 
+function readMemoWindowStateForBackup() {
+  try {
+    const value = JSON.parse(localStorage.getItem(MEMO_WINDOW_STATE_KEY));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function restoreStorageSnapshot(values) {
+  const keys = [STORAGE_KEY, MEMO_STORAGE_KEY, MEMO_WINDOW_STATE_KEY];
+  try {
+    keys.forEach((key) => localStorage.removeItem(key));
+    keys.forEach((key) => {
+      if (values[key] !== null) localStorage.setItem(key, values[key]);
+    });
+  } catch (error) {
+    console.error("Unable to roll back the previous backup state", error);
+  }
+}
+
 async function exportBackup() {
   try {
-    await TAURI?.core?.invoke("export_data", { json: JSON.stringify(state, null, 2) });
+    const backup = createBackupPayload(state, {
+      content: localStorage.getItem(MEMO_STORAGE_KEY) || "",
+      windowState: readMemoWindowStateForBackup(),
+    });
+    await TAURI?.core?.invoke("export_data", { json: JSON.stringify(backup, null, 2) });
   } catch (_) {}
 }
 
@@ -2397,17 +2484,52 @@ async function importBackup(overlay) {
   try {
     const content = await TAURI?.core?.invoke("import_data");
     if (!content) return;
+    const backup = parseBackupPayload(JSON.parse(content));
     const previousState = state;
-    state = migrateSnapshot(JSON.parse(content));
-    pruneTransientState();
-    if (!save()) {
+    const previousStorage = {
+      [STORAGE_KEY]: localStorage.getItem(STORAGE_KEY),
+      [MEMO_STORAGE_KEY]: localStorage.getItem(MEMO_STORAGE_KEY),
+      [MEMO_WINDOW_STATE_KEY]: localStorage.getItem(MEMO_WINDOW_STATE_KEY),
+    };
+    if (stateSaveTimer !== null) {
+      clearTimeout(stateSaveTimer);
+      stateSaveTimer = null;
+    }
+    const importedState = migrateSnapshot(backup.snapshot);
+    try {
+      state = importedState;
+      pruneTransientState();
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      if (backup.memo) {
+        localStorage.setItem(MEMO_STORAGE_KEY, backup.memo.content);
+        if (backup.memo.windowState) {
+          localStorage.setItem(
+            MEMO_WINDOW_STATE_KEY,
+            JSON.stringify(backup.memo.windowState),
+          );
+        } else {
+          localStorage.removeItem(MEMO_WINDOW_STATE_KEY);
+        }
+      }
+    } catch (error) {
       state = previousState;
-      showPersistenceError(overlay);
+      restoreStorageSnapshot(previousStorage);
+      console.error("Unable to import the backup", error);
+      showPersistenceError(overlay, "备份未能完整写入，原有数据已保留。请检查本地存储空间。");
       return;
+    }
+    syncMemoState();
+    if (backup.memo && TAURI?.event?.emitTo) {
+      try {
+        await TAURI.event.emitTo("memo", "memo-data-imported", {});
+      } catch (_) {}
     }
     overlay?.remove();
     render();
-  } catch (_) {}
+  } catch (error) {
+    console.error("Unable to read the backup", error);
+    showPersistenceError(overlay, "无法读取这个备份，文件可能已损坏或来自不受支持的版本。");
+  }
 }
 
 async function ensureNotificationPermission() {
@@ -2656,6 +2778,17 @@ document.querySelectorAll(".resize").forEach((handle) => {
 const windowEventUnlisteners = [];
 let maintenanceTimer = null;
 
+function onMemoStorageChanged(event) {
+  if (event.key !== MEMO_STORAGE_KEY) return;
+  syncMemoState({ hasContent: (event.newValue || "").trim().length > 0 });
+}
+
+function onMemoWindowMessage(event) {
+  if (event.origin !== window.location.origin) return;
+  if (event.data?.source !== "floating-todo-memo") return;
+  syncMemoState(event.data);
+}
+
 async function initializeApp() {
   await restoreWindowState();
   updateCompact(false);
@@ -2689,7 +2822,13 @@ async function initializeApp() {
       }
       applyAppearance();
     }),
+    listenToAppEvent("memo-state-changed", ({ payload }) => {
+      syncMemoState(payload || {});
+    }),
   ]);
+
+  window.addEventListener("storage", onMemoStorageChanged);
+  window.addEventListener("message", onMemoWindowMessage);
 
   await showReadyWindow();
 
@@ -2706,6 +2845,8 @@ window.addEventListener("beforeunload", () => {
   flushWindowState();
   if (appearanceFrame !== null) cancelAnimationFrame(appearanceFrame);
   if (maintenanceTimer !== null) clearInterval(maintenanceTimer);
+  window.removeEventListener("storage", onMemoStorageChanged);
+  window.removeEventListener("message", onMemoWindowMessage);
   windowEventUnlisteners.splice(0).forEach((unlisten) => unlisten());
 }, { once: true });
 

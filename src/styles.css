@@ -197,6 +197,15 @@ select:focus-visible {
   cursor: grab;
 }
 
+.header .titles {
+  flex: 1 1 0;
+  overflow: hidden;
+}
+
+.header .spacer {
+  display: none;
+}
+
 .app-symbol {
   display: grid;
   flex: 0 0 40px;
@@ -267,6 +276,27 @@ select:focus-visible {
 
 .icon-btn:active {
   transform: scale(0.96);
+}
+
+.memo-entry {
+  position: relative;
+  color: var(--blue);
+}
+
+.memo-entry.is-open {
+  background: var(--blue-soft);
+}
+
+.memo-entry.has-content:not(.is-open)::after {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 6px;
+  height: 6px;
+  border: 1.5px solid rgba(var(--panel-top), 0.96);
+  border-radius: 50%;
+  background: var(--blue);
+  content: "";
 }
 
 .timeline {
@@ -2144,6 +2174,11 @@ input[type="range"] {
   box-shadow: inset 0 0 0 0.5px var(--separator);
 }
 
+.horizon-header .memo-entry.is-open {
+  color: var(--blue);
+  background: var(--blue-soft);
+}
+
 .overview-screen {
   display: flex;
   min-height: 0;
@@ -3729,7 +3764,7 @@ html[data-theme="dark"] .overview-goal-list {
 
 .compact .titles p,
 .compact .app-symbol,
-.compact .icon-btn,
+.compact .icon-btn:not(.memo-entry),
 .compact .meta-date,
 .compact .goal-tag,
 .compact .goal-deadline-dot,

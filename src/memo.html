@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="system">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>备忘录</title>
+    <link rel="stylesheet" href="memo.css" />
+    <script src="memo.js" defer></script>
+  </head>
+  <body>
+    <main class="memo-panel" aria-label="备忘录">
+      <header class="memo-titlebar" id="memoDragHandle" data-tauri-drag-region>
+        <div class="memo-heading" data-tauri-drag-region>
+          <span class="memo-icon" aria-hidden="true" data-tauri-drag-region>
+            <svg viewBox="0 0 24 24" fill="none">
+              <path d="M6.75 3.75h10.5a2 2 0 0 1 2 2v9.5l-5 5h-7.5a2 2 0 0 1-2-2V5.75a2 2 0 0 1 2-2Z" stroke="currentColor" stroke-width="1.65" stroke-linejoin="round" />
+              <path d="M14.25 20.25v-3a2 2 0 0 1 2-2h3M8.25 8h7.5M8.25 11.5h5.25" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </span>
+          <h1 data-tauri-drag-region>备忘录</h1>
+        </div>
+        <button class="memo-close" id="memoClose" type="button" aria-label="关闭备忘录" title="关闭">
+          <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+            <path d="m6 6 8 8M14 6l-8 8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+          </svg>
+        </button>
+      </header>
+
+      <div class="memo-content">
+        <textarea
+          id="memoInput"
+          aria-label="备忘录内容"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="随手记点什么…"
+        ></textarea>
+      </div>
+    </main>
+
+    <div class="resize-handle resize-n" data-resize-direction="North" aria-hidden="true"></div>
+    <div class="resize-handle resize-s" data-resize-direction="South" aria-hidden="true"></div>
+    <div class="resize-handle resize-e" data-resize-direction="East" aria-hidden="true"></div>
+    <div class="resize-handle resize-w" data-resize-direction="West" aria-hidden="true"></div>
+    <div class="resize-handle resize-ne" data-resize-direction="NorthEast" aria-hidden="true"></div>
+    <div class="resize-handle resize-nw" data-resize-direction="NorthWest" aria-hidden="true"></div>
+    <div class="resize-handle resize-se" data-resize-direction="SouthEast" aria-hidden="true"></div>
+    <div class="resize-handle resize-sw" data-resize-direction="SouthWest" aria-hidden="true"></div>
+  </body>
+</html>

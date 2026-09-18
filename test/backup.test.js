@@ -24,11 +24,11 @@ test("new backups include todo state, memo content, and memo geometry", () => {
   assert.doesNotThrow(() => new Date(payload.exportedAt).toISOString());
 });
 
-test("new backup envelopes restore memo data", () => {
+test("v0.6.0 backup envelopes migrate plain memo data", () => {
   const snapshot = { version: 6, items: [] };
   const parsed = parseBackupPayload({
     format: BACKUP_FORMAT,
-    version: BACKUP_FORMAT_VERSION,
+    version: 1,
     snapshot,
     memo: {
       content: "复习计划",
@@ -75,11 +75,27 @@ test("corrupted memo backup data is rejected instead of clearing the current not
     () => parseBackupPayload({
       format: BACKUP_FORMAT,
       version: BACKUP_FORMAT_VERSION,
-      snapshot: {},
+      snapshot: { version: 6, items: [] },
       memo: { content: 42, windowState: null },
     }),
     /Invalid memo data/,
   );
+});
+
+test("rich memo backups round-trip text, selected bold, font size and pin preference", () => {
+  const document = {
+    version: 2, text: "报名材料\n复习计划", bold: [{ start: 0, end: 4 }],
+    fontSize: 20, pinned: false,
+  };
+  const payload = createBackupPayload({ version: 6, items: [] }, { document });
+  assert.deepEqual(parseBackupPayload(JSON.parse(JSON.stringify(payload))).memo.document, document);
+  payload.memo.document.bold[0].end = 999;
+  assert.throws(() => parseBackupPayload(payload), /Invalid memo data/);
+});
+
+test("an envelope with an unrelated snapshot cannot clear todo data", () => {
+  const payload = createBackupPayload({}, { content: "保留内容" });
+  assert.throws(() => parseBackupPayload(payload), /Unsupported/);
 });
 
 test("unrelated JSON is rejected instead of replacing todos with an empty snapshot", () => {

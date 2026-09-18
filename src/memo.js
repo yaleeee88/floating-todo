@@ -1,9 +1,11 @@
-"use strict";
+import {
+  MEMO_DOCUMENT_KEY, MEMO_FONT, readMemoDocument,
+  normalizeMemoDocument, renderMemoDocument, serializeMemoEditor,
+} from "./memo-document.js";
 
 const TAURI = window.__TAURI__;
 const appWindow = TAURI?.window?.getCurrentWindow?.();
 
-const MEMO_KEY = "floating-todo/memo-v1";
 const WINDOW_STATE_KEY = "floating-todo/memo-window-state-v1";
 const SNAPSHOT_KEY = "floating-todo/snapshot";
 const SAVE_INTERVAL = 220;
@@ -16,12 +18,20 @@ const WINDOW_LIMITS = Object.freeze({
 
 const memoInput = document.getElementById("memoInput");
 const closeButton = document.getElementById("memoClose");
+const pinButton = document.getElementById("memoPin");
+const boldButton = document.getElementById("memoBold");
+const status = document.getElementById("memoStatus");
 
 let textSaveTimer = null;
 let geometrySaveTimer = null;
 let lastTextSaveAt = 0;
 let rememberedGeometry = readWindowGeometry();
 let closing = false;
+let memoDocument = normalizeMemoDocument(null);
+let memoLoaded = false;
+let savedSelection = null;
+let statusTimer = null;
+let composing = false;
 const unlisteners = [];
 
 function finiteNumber(value) {
@@ -61,20 +71,18 @@ function readWindowGeometry() {
   }
 }
 
-function readMemo() {
-  try {
-    return localStorage.getItem(MEMO_KEY) || "";
-  } catch (_) {
-    return "";
-  }
-}
-
 async function reloadMemoFromStorage({ restoreGeometry = false } = {}) {
   if (textSaveTimer !== null) {
     clearTimeout(textSaveTimer);
     textSaveTimer = null;
   }
-  memoInput.value = readMemo();
+  memoDocument = readMemoDocument(localStorage);
+  renderMemoDocument(memoInput, memoDocument);
+  savedSelection = null;
+  memoLoaded = true;
+  applyFontSize();
+  updateEditorState();
+  await applyPinState();
   rememberedGeometry = readWindowGeometry();
   if (restoreGeometry) await restoreWindowGeometry();
 }
@@ -118,11 +126,97 @@ function persistMemo() {
     textSaveTimer = null;
   }
   lastTextSaveAt = performance.now();
+  if (!memoLoaded) return false;
   try {
-    localStorage.setItem(MEMO_KEY, memoInput.value);
+    memoDocument = serializeMemoEditor(memoInput, memoDocument);
+    localStorage.setItem(MEMO_DOCUMENT_KEY, JSON.stringify(memoDocument));
+    return true;
   } catch (error) {
     console.warn("Unable to persist memo", error);
+    showStatus("保存失败，请暂时保留窗口并复制内容", false);
+    return false;
   }
+}
+
+function showStatus(message, temporary = true) {
+  clearTimeout(statusTimer);
+  status.textContent = message;
+  if (temporary) statusTimer = setTimeout(() => { status.textContent = ""; }, 1800);
+}
+
+function applyFontSize() {
+  memoInput.style.setProperty("--memo-font-size", `${memoDocument.fontSize}px`);
+}
+
+function changeFontSize(delta) {
+  memoDocument.fontSize = delta === 0 ? MEMO_FONT.default
+    : clamp(memoDocument.fontSize + delta, MEMO_FONT.min, MEMO_FONT.max);
+  applyFontSize();
+  if (persistMemo()) showStatus(`字号 ${memoDocument.fontSize}`);
+}
+
+function updatePinButton() {
+  pinButton.setAttribute("aria-pressed", String(memoDocument.pinned));
+  pinButton.title = memoDocument.pinned ? "取消置顶" : "置顶备忘录";
+  pinButton.setAttribute("aria-label", pinButton.title);
+}
+
+async function applyPinState() {
+  if (appWindow) {
+    try {
+      await appWindow.setAlwaysOnTop(memoDocument.pinned);
+    } catch (error) {
+      console.warn("Unable to set memo pin state", error);
+      showStatus("无法设置置顶，请重新打开备忘录", false);
+      return false;
+    }
+  }
+  updatePinButton();
+  return true;
+}
+
+async function togglePin() {
+  if (pinButton.disabled) return;
+  pinButton.disabled = true;
+  const previous = memoDocument.pinned;
+  memoDocument.pinned = !previous;
+  if (await applyPinState()) {
+    persistMemo();
+    if (!appWindow) showStatus("已记住选择，桌面版支持窗口置顶");
+  } else {
+    memoDocument.pinned = previous;
+    updatePinButton();
+  }
+  pinButton.disabled = false;
+}
+
+function editorSelection() {
+  const selection = window.getSelection();
+  if (!selection?.rangeCount) return null;
+  const range = selection.getRangeAt(0);
+  return memoInput.contains(range.startContainer) && memoInput.contains(range.endContainer)
+    ? range : null;
+}
+
+function updateEditorState() {
+  memoInput.dataset.empty = String(!memoInput.textContent && !memoInput.innerText.trim());
+  const range = editorSelection();
+  if (range) savedSelection = range.cloneRange();
+  boldButton.setAttribute("aria-pressed", String(!!range && document.queryCommandState("bold")));
+}
+
+function toggleBold() {
+  if (composing || !memoLoaded) return;
+  memoInput.focus({ preventScroll: true });
+  if (savedSelection && memoInput.contains(savedSelection.commonAncestorContainer)) {
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(savedSelection);
+  }
+  // Native editing commands retain selection and the browser's undo history.
+  document.execCommand("bold", false);
+  updateEditorState();
+  scheduleMemoSave();
 }
 
 function scheduleMemoSave() {
@@ -269,7 +363,7 @@ async function bindWindowPersistence() {
 
 async function notifyMain(open) {
   const payload = {
-    hasContent: memoInput.value.trim().length > 0,
+    hasContent: memoInput.textContent.trim().length > 0,
     open,
     source: "floating-todo-memo",
   };
@@ -285,8 +379,8 @@ async function notifyMain(open) {
 
 async function closeMemo() {
   if (closing) return;
+  if (memoLoaded && !persistMemo()) return;
   closing = true;
-  persistMemo();
   persistWindowGeometry();
 
   await notifyMain(false);
@@ -306,8 +400,42 @@ async function closeMemo() {
 }
 
 function bindInteractions() {
-  memoInput.addEventListener("input", scheduleMemoSave);
-  closeButton.addEventListener("mousedown", (event) => event.stopPropagation());
+  memoInput.addEventListener("input", () => {
+    updateEditorState();
+    if (!composing) scheduleMemoSave();
+  });
+  memoInput.addEventListener("compositionstart", () => { composing = true; });
+  memoInput.addEventListener("compositionend", () => {
+    composing = false;
+    updateEditorState();
+    scheduleMemoSave();
+  });
+  memoInput.addEventListener("paste", (event) => {
+    event.preventDefault();
+    const text = event.clipboardData?.getData("text/plain");
+    if (text) document.execCommand("insertText", false, text);
+  });
+  // Keep external HTML/files out of the small text-only editor.
+  memoInput.addEventListener("drop", (event) => event.preventDefault());
+  memoInput.addEventListener("dragover", (event) => event.preventDefault());
+  memoInput.addEventListener("beforeinput", (event) => {
+    if (event.inputType === "insertLineBreak" && !event.isComposing) {
+      event.preventDefault();
+      document.execCommand("insertText", false, "\n");
+    } else if (event.inputType === "formatItalic" || event.inputType === "formatUnderline") {
+      event.preventDefault();
+    }
+  });
+  document.addEventListener("selectionchange", updateEditorState);
+  document.querySelectorAll(".memo-tool").forEach((button) => {
+    button.addEventListener("mousedown", (event) => {
+      event.stopPropagation();
+      // Preserve the selected words when clicking the formatting button.
+      if (button === boldButton) event.preventDefault();
+    });
+  });
+  boldButton.addEventListener("click", toggleBold);
+  pinButton.addEventListener("click", togglePin);
   closeButton.addEventListener("click", closeMemo);
   document.querySelectorAll("[data-resize-direction]").forEach((handle) => {
     handle.addEventListener("mousedown", (event) => {
@@ -321,13 +449,26 @@ function bindInteractions() {
   window.addEventListener("storage", (event) => {
     if (event.key === SNAPSHOT_KEY) {
       applyAppearance();
-    } else if (event.key === MEMO_KEY) {
+    } else if (event.key === MEMO_DOCUMENT_KEY) {
       void reloadMemoFromStorage();
     } else if (event.key === WINDOW_STATE_KEY) {
       void reloadMemoFromStorage({ restoreGeometry: true });
     }
   });
   window.addEventListener("keydown", (event) => {
+    if (event.isComposing || composing) return;
+    if ((event.ctrlKey || event.metaKey) && !event.altKey) {
+      if (["+", "=", "-", "_", "0"].includes(event.key)) {
+        event.preventDefault();
+        changeFontSize(event.key === "0" ? 0 : ["-", "_"].includes(event.key) ? -1 : 1);
+        return;
+      }
+      if (event.key.toLowerCase() === "b") {
+        event.preventDefault();
+        toggleBold();
+        return;
+      }
+    }
     if (event.key === "Escape") closeMemo();
   });
 }
@@ -337,12 +478,14 @@ function flushAndCleanUp() {
   persistWindowGeometry();
   if (!closing) void notifyMain(false);
   unlisteners.splice(0).forEach((unlisten) => unlisten());
+  clearTimeout(statusTimer);
+  document.removeEventListener("selectionchange", updateEditorState);
 }
 
 async function initializeMemo() {
   applyAppearance();
-  memoInput.value = readMemo();
   bindInteractions();
+  await reloadMemoFromStorage();
   await restoreWindowGeometry();
   await bindWindowPersistence();
 
@@ -362,7 +505,12 @@ async function initializeMemo() {
 window.addEventListener("beforeunload", flushAndCleanUp, { once: true });
 window.addEventListener("pagehide", flushAndCleanUp, { once: true });
 
-initializeMemo().catch((error) => {
+initializeMemo().catch(async (error) => {
   console.error("Unable to initialize memo", error);
+  memoInput.contentEditable = "false";
+  pinButton.disabled = true;
+  boldButton.disabled = true;
+  showStatus("无法读取备忘录，原有内容已保留", false);
   document.body.classList.add("ready");
+  try { await appWindow?.show(); } catch (_) {}
 });

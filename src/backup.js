@@ -1,5 +1,7 @@
+import { isMemoDocument, normalizeMemoDocument } from "./memo-document.js";
+
 export const BACKUP_FORMAT = "floating-todo-backup";
-export const BACKUP_FORMAT_VERSION = 1;
+export const BACKUP_FORMAT_VERSION = 2;
 
 function isRecord(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -22,13 +24,16 @@ function isLegacySnapshot(value) {
 }
 
 export function createBackupPayload(snapshot, memo = {}) {
+  const document = normalizeMemoDocument(memo.document,
+    typeof memo.content === "string" ? memo.content : "");
   return {
     format: BACKUP_FORMAT,
     version: BACKUP_FORMAT_VERSION,
     exportedAt: new Date().toISOString(),
     snapshot,
     memo: {
-      content: typeof memo.content === "string" ? memo.content : "",
+      content: document.text,
+      document,
       windowState: isRecord(memo.windowState) ? memo.windowState : null,
     },
   };
@@ -41,7 +46,7 @@ export function parseBackupPayload(value) {
     }
     return { snapshot: value, memo: null };
   }
-  if (value.version !== BACKUP_FORMAT_VERSION || !isRecord(value.snapshot)) {
+  if (![1, BACKUP_FORMAT_VERSION].includes(value.version) || !isLegacySnapshot(value.snapshot)) {
     throw new Error("Unsupported floating-todo backup format");
   }
   const memo = value.memo;
@@ -52,10 +57,16 @@ export function parseBackupPayload(value) {
   ) {
     throw new Error("Invalid memo data in floating-todo backup");
   }
+  if (value.version === 2 && (!isMemoDocument(memo.document) || memo.document.text !== memo.content)) {
+    throw new Error("Invalid memo data in floating-todo backup");
+  }
   return {
     snapshot: value.snapshot,
     memo: {
       content: memo.content,
+      document: value.version === 1
+        ? normalizeMemoDocument(null, memo.content)
+        : normalizeMemoDocument(memo.document),
       windowState: memo.windowState,
     },
   };

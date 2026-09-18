@@ -22,12 +22,12 @@ test("the memo is a lazy standalone WebView instead of a startup window", async 
   assert.match(backend, /get_webview_window\(MEMO_WINDOW_LABEL\)/);
 });
 
-test("the memo surface stays focused on one input and one close action", async () => {
+test("the memo surface keeps one editor and compact formatting/window controls", async () => {
   const html = await source("src/memo.html");
   const css = await source("src/memo.css");
 
-  assert.equal((html.match(/<textarea\b/g) || []).length, 1);
-  assert.equal((html.match(/<button\b/g) || []).length, 1);
+  assert.equal((html.match(/contenteditable="true"/g) || []).length, 1);
+  assert.equal((html.match(/<button\b/g) || []).length, 3);
   assert.doesNotMatch(html, /main\.js|styles\.css/);
   assert.doesNotMatch(css, /backdrop-filter|\bfilter\s*:/);
 });
@@ -35,7 +35,7 @@ test("the memo surface stays focused on one input and one close action", async (
 test("memo content and geometry are saved and closing releases its WebView", async () => {
   const memo = await source("src/memo.js");
 
-  assert.match(memo, /floating-todo\/memo-v1/);
+  assert.match(memo, /readMemoDocument/);
   assert.match(memo, /floating-todo\/memo-window-state-v1/);
   assert.match(memo, /setTimeout\(persistMemo/);
   assert.match(memo, /pagehide/);

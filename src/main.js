@@ -21,6 +21,7 @@ import {
   WINDOW_LIMITS,
 } from "./window-state.js";
 import { createBackupPayload, parseBackupPayload } from "./backup.js";
+import { MEMO_DOCUMENT_KEY, readMemoDocument } from "./memo-document.js";
 
 const TAURI = window.__TAURI__;
 const appWindow = TAURI?.window?.getCurrentWindow?.();
@@ -65,7 +66,7 @@ function readWindowState() {
 
 function readMemoHasContent() {
   try {
-    return (localStorage.getItem(MEMO_STORAGE_KEY) || "").trim().length > 0;
+    return readMemoDocument(localStorage).text.trim().length > 0;
   } catch (_) {
     return false;
   }
@@ -2459,7 +2460,7 @@ function readMemoWindowStateForBackup() {
 }
 
 function restoreStorageSnapshot(values) {
-  const keys = [STORAGE_KEY, MEMO_STORAGE_KEY, MEMO_WINDOW_STATE_KEY];
+  const keys = [STORAGE_KEY, MEMO_STORAGE_KEY, MEMO_DOCUMENT_KEY, MEMO_WINDOW_STATE_KEY];
   try {
     keys.forEach((key) => localStorage.removeItem(key));
     keys.forEach((key) => {
@@ -2473,7 +2474,7 @@ function restoreStorageSnapshot(values) {
 async function exportBackup() {
   try {
     const backup = createBackupPayload(state, {
-      content: localStorage.getItem(MEMO_STORAGE_KEY) || "",
+      document: readMemoDocument(localStorage),
       windowState: readMemoWindowStateForBackup(),
     });
     await TAURI?.core?.invoke("export_data", { json: JSON.stringify(backup, null, 2) });
@@ -2489,6 +2490,7 @@ async function importBackup(overlay) {
     const previousStorage = {
       [STORAGE_KEY]: localStorage.getItem(STORAGE_KEY),
       [MEMO_STORAGE_KEY]: localStorage.getItem(MEMO_STORAGE_KEY),
+      [MEMO_DOCUMENT_KEY]: localStorage.getItem(MEMO_DOCUMENT_KEY),
       [MEMO_WINDOW_STATE_KEY]: localStorage.getItem(MEMO_WINDOW_STATE_KEY),
     };
     if (stateSaveTimer !== null) {
@@ -2502,6 +2504,7 @@ async function importBackup(overlay) {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
       if (backup.memo) {
         localStorage.setItem(MEMO_STORAGE_KEY, backup.memo.content);
+        localStorage.setItem(MEMO_DOCUMENT_KEY, JSON.stringify(backup.memo.document));
         if (backup.memo.windowState) {
           localStorage.setItem(
             MEMO_WINDOW_STATE_KEY,
@@ -2779,8 +2782,8 @@ const windowEventUnlisteners = [];
 let maintenanceTimer = null;
 
 function onMemoStorageChanged(event) {
-  if (event.key !== MEMO_STORAGE_KEY) return;
-  syncMemoState({ hasContent: (event.newValue || "").trim().length > 0 });
+  if (event.key !== MEMO_STORAGE_KEY && event.key !== MEMO_DOCUMENT_KEY) return;
+  syncMemoState();
 }
 
 function onMemoWindowMessage(event) {

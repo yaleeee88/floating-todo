@@ -142,7 +142,7 @@ async fn open_memo_window(app: AppHandle) -> Result<(), String> {
     .resizable(true)
     .decorations(false)
     .transparent(true)
-    .always_on_top(true)
+    .always_on_top(false)
     .skip_taskbar(true)
     .shadow(false)
     .visible(false)
@@ -160,8 +160,7 @@ async fn open_memo_window(app: AppHandle) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
     }
 
-    show_window(&window, true);
-
+    // The frontend restores the saved pin state and geometry before showing.
     Ok(())
 }
 

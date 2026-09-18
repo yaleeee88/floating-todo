@@ -73,9 +73,25 @@ Windows 构建产物位于 `src-tauri/target/release/bundle/nsis/`，macOS 构�
 - Tauri 2（Rust 后端 + 系统 WebView）
 - 原生 HTML / CSS / JavaScript，无前端框架运行时
 - 备忘录使用原生编辑区与撤销历史，仅存文字和加粗范围，没有引入富文本编辑器依赖
+- 备忘录仅在内容或偏好发生变化时保存；字号/置顶变化不会重新遍历正文，失焦与关闭仍会立即补存，正常编辑保存间隔仍为 220ms
+- 两个窗口通过小型主题/内容有无信号同步，不再因每次勾选或输入而解析对方的完整数据；信号不替代原始存档
+- 主面板按区域复用 DOM，未变化的卡片不重新解析；勾选、展开、切换动画与键盘焦点保留，不引入前端框架
+- 已完成历史先选取最近 16 条再参与展示，隐藏记录不做日期计算；展开时仍可查看全部记录，不裁剪存档
 - 单个每分钟定时器负责刷新相对日期和检查到点提醒
 - 备忘录窗口按需创建，关闭时销毁独立 WebView；主窗口和便签失焦后都会切换到 WebView2 低内存目标
 - 本地持久化，无账户、无网络同步、无广告
 - Windows NSIS 升级直接覆盖原安装，不经过卸载流程
 
 原始项目及作者信息请见 [BUG-gao/floating-todo](https://github.com/BUG-gao/floating-todo)。
+
+### 回归与性能检查
+
+`npm test` 检查数据迁移、排序、备份和发布配置。安装 Playwright 与 Edge 后，可运行：
+
+```bash
+node scripts/verify-memo.mjs
+node scripts/verify-performance.mjs
+node scripts/benchmark-performance.mjs
+```
+
+脚本也接受已安装的 `playwright/index.mjs` 绝对路径作为首个参数；基准脚本第二个参数可传 `v0.6.1` 等 Git 引用进行对比。所有浏览器测试使用隔离数据，不接触安装版的存档。基准输出为页面计算与 DOM 开销，不能视作整个桌面应用的内存节省比例。

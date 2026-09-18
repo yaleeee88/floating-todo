@@ -22,6 +22,9 @@ import {
 } from "./window-state.js";
 import { createBackupPayload, parseBackupPayload } from "./backup.js";
 import { MEMO_DOCUMENT_KEY, readMemoDocument } from "./memo-document.js";
+import { MEMO_PRESENCE_KEY, publishAppearance, publishSignal } from "./window-sync.js";
+import { selectTimelineEntries } from "./timeline-selection.js";
+import { updateRegions } from "./patch-dom.js";
 
 const TAURI = window.__TAURI__;
 const appWindow = TAURI?.window?.getCurrentWindow?.();
@@ -107,6 +110,7 @@ function save() {
   }
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    publishAppearance(localStorage, state.settings);
     return true;
   } catch (error) {
     statusAnnouncement = "本地存储空间不足，新更改暂时无法保存";
@@ -284,6 +288,21 @@ function queueMotionCue(type, id, routineId = "", subtaskId = "") {
   pendingMotionCue = { type, id, routineId, subtaskId };
 }
 
+function animateClass(element, name) {
+  if (!element) return;
+  if (element.classList.contains(name)) {
+    element.getAnimations().forEach((animation) => {
+      if (animation.animationName) { animation.currentTime = 0; animation.play(); }
+    });
+  } else element.classList.add(name);
+}
+
+app.addEventListener("animationend", (event) => {
+  for (const name of [...event.target.classList]) {
+    if (name.startsWith("motion-")) event.target.classList.remove(name);
+  }
+});
+
 function playPendingMotionCue() {
   const cue = pendingMotionCue;
   pendingMotionCue = null;
@@ -298,7 +317,7 @@ function playPendingMotionCue() {
     const expanded = matching
       .map((element) => element.closest(".todo-row"))
       .find((row) => row?.querySelector(".todo-expanded"));
-    expanded?.querySelector(".todo-expanded")?.classList.add("motion-reveal");
+    animateClass(expanded?.querySelector(".todo-expanded"), "motion-reveal");
     return;
   }
 
@@ -306,9 +325,8 @@ function playPendingMotionCue() {
     element.closest(".overview-action, .todo-row, .overview-goal, .nearest-node, .horizon-entry")
   ).filter(Boolean));
   rows.forEach((row) => {
-    row.classList.add("motion-state-change");
-    row.querySelector(".check.on, .overview-check.on, .subtask-check.on, .goal-progress.complete")
-      ?.classList.add("motion-check-pop");
+    animateClass(row, "motion-state-change");
+    animateClass(row.querySelector(".check.on, .overview-check.on, .subtask-check.on, .goal-progress.complete"), "motion-check-pop");
   });
 }
 
@@ -420,10 +438,10 @@ function timelineTier(entry, dateKey = toDateKey()) {
 
 function getTimelineEntries() {
   const dateKey = toDateKey();
-  const entries = [
-    ...state.items.map((item) => ({ kind: "todo", value: item })),
-    ...(state.goals || []).map((goal) => ({ kind: "goal", value: goal })),
-  ].map((entry) => ({
+  const selection = selectTimelineEntries(state.items, state.goals || [], {
+    limit: COMPLETED_RENDER_LIMIT, showAll: showAllCompleted,
+  });
+  const entries = selection.pending.map((entry) => ({
     entry,
     tier: timelineTier(entry, dateKey),
     due: entry.kind === "todo"
@@ -432,33 +450,17 @@ function getTimelineEntries() {
           dueTime: entry.value.dueTime || "",
         })
       : goalSortTimestamp(entry.value, dateKey),
-    completedAt: entry.kind === "todo" && isRecurringTodo(entry.value)
-      ? todoRecordForDate(entry.value, dateKey)?.completedAt || 0
-      : entry.value.completedAt || 0,
     createdAt: entry.value.createdAt || 0,
   }));
-  return entries.sort((a, b) => {
+  const sorted = entries.sort((a, b) => {
     if (a.tier !== b.tier) return a.tier - b.tier;
-    if (a.tier === 4) return b.completedAt - a.completedAt;
     if (a.due !== b.due) return a.due - b.due;
     return a.createdAt - b.createdAt;
   }).map(({ entry }) => entry);
-}
-
-function limitCompletedEntries(entries) {
-  let completedCount = 0;
-  const visibleEntries = entries.filter((entry) => {
-    const completed = entry.kind === "todo"
-      ? !isRecurringTodo(entry.value) && !!entry.value.completed
-      : entry.value.status === "completed";
-    if (!completed) return true;
-    completedCount += 1;
-    return showAllCompleted || completedCount <= COMPLETED_RENDER_LIMIT;
-  });
   return {
-    entries: visibleEntries,
-    completedCount,
-    hiddenCount: Math.max(0, completedCount - COMPLETED_RENDER_LIMIT),
+    entries: sorted.concat(selection.completed),
+    completedCount: selection.completedCount,
+    hiddenCount: selection.hiddenCount,
   };
 }
 
@@ -523,7 +525,7 @@ function todayGoalActionsHtml() {
       <span class="today-actions-chevron" aria-hidden="true">${ICONS.arrow}</span>
     </button>
     ${showList ? `<ul class="today-actions-list" id="today-actions-list">
-      ${displayedActions.map(({ goal, routine, completed: checked }) => `<li class="today-action-row ${checked ? "done" : ""}">
+      ${displayedActions.map(({ goal, routine, completed: checked }) => `<li data-dom-key="${esc(JSON.stringify([goal.id, routine.id]))}" class="today-action-row ${checked ? "done" : ""}">
         <button class="subtask-check ${checked ? "on" : ""}" data-act="goal-routine-toggle" data-id="${esc(goal.id)}" data-routine-id="${esc(routine.id)}" data-focus-scope="today" role="checkbox" aria-checked="${checked}" aria-label="${checked ? "恢复" : "完成"}今日行动：${esc(routine.title)}">${checked ? ICONS.check : ""}</button>
         <button class="today-action-main" data-act="goal-reveal" data-id="${esc(goal.id)}" aria-label="查看阶段目标${esc(goal.title)}">
           <span class="today-action-title">${esc(routine.title)}</span>
@@ -794,7 +796,7 @@ function overviewActionRowHtml(action) {
   const revealAct = isTodo ? "todo-reveal" : "goal-reveal";
   const timeLabel = timeRangeLabel(action.startTime, action.endTime, "");
   const overdue = isTodo && !action.recurring && dayDistance(action.dateKey) < 0;
-  return `<li class="overview-action ${action.completed ? "done" : ""} ${overdue ? "overdue" : ""}">
+  return `<li data-dom-key="${esc(JSON.stringify([action.kind, action.id, action.routineId]))}" class="overview-action ${action.completed ? "done" : ""} ${overdue ? "overdue" : ""}">
     <button class="overview-check ${action.completed ? "on" : ""}" data-act="${toggleAct}" data-id="${esc(action.id)}" ${isTodo ? "" : `data-routine-id="${esc(action.routineId)}" data-focus-scope="overview"`} role="checkbox" aria-checked="${action.completed}" aria-label="${action.completed ? "恢复" : "完成"}${esc(action.title)}">${action.completed ? ICONS.check : ""}</button>
     <button class="overview-action-main" data-act="${revealAct}" data-id="${esc(action.id)}" aria-label="查看${esc(action.title)}详情">
       <span class="overview-action-title">${esc(action.title)}</span>
@@ -852,7 +854,7 @@ function horizonBucketHtml(key, label, entries, allEntries = entries) {
 
 function horizonOverviewHtml(futureEntries, buckets, allBuckets) {
   const nearest = futureEntries[0];
-  return `<section class="overview-card nearest-card" aria-labelledby="nearest-title">
+  return [`<section class="overview-card nearest-card" aria-labelledby="nearest-title">
       <div class="overview-section-kicker" id="nearest-title">最近节点</div>
       ${nearest
         ? `${overviewEntryButtonHtml(nearest, `nearest-node ${nearest.kind}`)}
@@ -860,15 +862,15 @@ function horizonOverviewHtml(futureEntries, buckets, allBuckets) {
             <span class="nearest-copy"><small>${nearest.kind === "goal" ? "阶段目标" : "重要节点"}</small><strong>${esc(nearest.title)}</strong><span><time datetime="${esc(nearest.dateKey)}">${esc(shortDateLabel(nearest.dateKey))}</time> · ${esc(compactRelativeLabel(nearest.dateKey))}</span></span>
             <span class="nearest-arrow">${ICONS.arrow}</span></button>`
         : `<button class="nearest-node empty" data-act="new-menu"><span class="nearest-icon">${ICONS.calendar}</span><span class="nearest-copy"><strong>还没有未来节点</strong><span>添加考试、比赛或截止日期</span></span>${ICONS.plus}</button>`}
-    </section>
-    <section class="overview-card horizon-card" aria-labelledby="horizon-title">
+    </section>`,
+    `<section class="overview-card horizon-card" aria-labelledby="horizon-title">
       <div class="overview-section-head compact-head"><div><h2 id="horizon-title">时间地平线</h2><p>${futureEntries.length ? `${futureEntries.length} 个未来节点` : "未来安排会在这里展开"}</p></div></div>
       <div class="horizon-bands">
         ${horizonBucketHtml("within30Days", "30天内", buckets.within30Days, allBuckets.within30Days)}
         ${horizonBucketHtml("within90Days", "31–90天", buckets.within90Days, allBuckets.within90Days)}
         ${horizonBucketHtml("beyond90Days", "90天后", buckets.beyond90Days, allBuckets.beyond90Days)}
       </div>
-    </section>`;
+    </section>`];
 }
 
 function overviewGoalsHtml(todayActionCount, horizonDensity = 1) {
@@ -984,10 +986,9 @@ function render() {
   applyAppearance();
   const renderedView = compact ? "list" : activeMainView;
   const overview = renderedView === "overview";
-  const allEntries = overview ? [] : getTimelineEntries();
   const completedView = overview
     ? { entries: [], completedCount: 0, hiddenCount: 0 }
-    : limitCompletedEntries(allEntries);
+    : getTimelineEntries();
   const entries = completedView.entries;
   const todayActions = overview ? getOverviewTodayActions() : [];
   const futureEntries = overview
@@ -1010,37 +1011,40 @@ function render() {
   const subtitle = overview
     ? `${todayHeaderLabel()} · 今天 ${pendingToday} 项 · 未来 ${futureEntries.length} 个节点`
     : `${todayHeaderLabel()} · ${headerStatusSummary()}`;
-  const mainContent = overview
-    ? `${overviewTodayHtml(todayActions)}
-      ${horizonOverviewHtml(futureEntries, horizonBuckets, allHorizonBuckets)}
-      ${overviewGoalsHtml(pendingToday, horizonDensity)}`
-    : `${todayGoalActionsHtml()}
-      ${allEntries.length
-        ? entries.map((entry) => entry.kind === "goal" ? goalRowHtml(entry.value) : rowHtml(entry.value)).join("")
-        : `<div class="empty-state">${ICONS.empty}<strong>当前没有待办</strong><span>写下下一件重要的事吧</span></div>`}
-      ${completedView.hiddenCount
-        ? `<button class="completed-overflow" data-act="completed-overflow">${showAllCompleted ? "收起较早完成项" : `显示更早已完成 · ${completedView.hiddenCount}`}</button>`
-        : ""}`;
+  const mainRegions = overview
+    ? [
+        { key: "today", html: overviewTodayHtml(todayActions) },
+        ...horizonOverviewHtml(futureEntries, horizonBuckets, allHorizonBuckets)
+          .map((html, index) => ({ key: `horizon-${index}`, html })),
+        { key: "goals", html: overviewGoalsHtml(pendingToday, horizonDensity) },
+      ]
+    : [
+        { key: "today-actions", html: todayGoalActionsHtml() },
+        ...entries.map((entry) => ({ key: `${entry.kind}:${entry.value.id}`, html: entry.kind === "goal" ? goalRowHtml(entry.value) : rowHtml(entry.value) })),
+        { key: "empty", html: entries.length ? "" : `<div class="empty-state">${ICONS.empty}<strong>当前没有待办</strong><span>写下下一件重要的事吧</span></div>` },
+        { key: "completed-overflow", html: completedView.hiddenCount
+          ? `<button class="completed-overflow" data-act="completed-overflow">${showAllCompleted ? "收起较早完成项" : `显示更早已完成 · ${completedView.hiddenCount}`}</button>` : "" },
+      ];
 
   const animateView = renderedView !== lastRenderedMainView;
-  app.innerHTML = `
+  updateRegions(app, [{ key: "header", html: `
     <header class="header ${overview ? "horizon-header" : "list-header"}" data-drag-region>
       ${overview ? "" : `<div class="app-symbol">${ICONS.reminders}</div>`}
       <div class="titles"><h1>${overview ? "时间地平线" : "完整清单"}</h1><p aria-live="polite">${esc(subtitle)}</p></div>
       <div class="spacer"></div>
       <button class="icon-btn memo-entry ${memoWindowOpen ? "is-open" : ""} ${memoHasContent && !memoWindowOpen ? "has-content" : ""}" data-act="memo" title="${memoWindowOpen ? "聚焦备忘录" : memoHasContent ? "打开备忘录" : "新建备忘录"}" aria-label="新建或打开备忘录" aria-pressed="${memoWindowOpen}">${ICONS.memoPlus}</button>
       <button class="icon-btn" data-act="settings" title="设置" aria-label="设置">${ICONS.gear}</button>
-    </header>
-
-    <main class="${overview ? `overview-screen ${pendingToday >= 3 ? "many-today" : ""}` : "timeline"} main-scroll ${animateView ? "motion-view-enter" : ""}" data-main-view="${renderedView}">${mainContent}</main>
-    ${compact ? "" : overviewDockHtml(renderedView)}
-    ${compact ? '<button class="compact-open" data-act="grow">展开</button>' : ""}
-    <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">${esc(statusAnnouncement)}</div>
-  `;
+    </header>` },
+    { key: "main", preserveChildren: true, html: `<main class="${overview ? `overview-screen ${pendingToday >= 3 ? "many-today" : ""}` : "timeline"} main-scroll" data-main-view="${renderedView}"></main>` },
+    { key: "dock", html: compact ? '<button class="compact-open" data-act="grow">展开</button>' : overviewDockHtml(renderedView) },
+    { key: "status", html: `<div class="sr-only" role="status" aria-live="polite" aria-atomic="true">${esc(statusAnnouncement)}</div>` },
+  ]);
   lastRenderedMainView = renderedView;
 
   const main = app.querySelector(".main-scroll");
-  if (main) main.scrollTop = viewScrollTop[renderedView] || 0;
+  updateRegions(main, mainRegions);
+  if (animateView && !reducedMotionQuery.matches) animateClass(main, "motion-view-enter");
+  if (main) main.scrollTo({ top: viewScrollTop[renderedView] || 0, behavior: "instant" });
   if (activeKey) {
     const restored = [...app.querySelectorAll(`[data-act="${activeKey.act}"]`)]
       .find((element) =>
@@ -2522,6 +2526,8 @@ async function importBackup(overlay) {
       return;
     }
     syncMemoState();
+    publishSignal(localStorage, MEMO_PRESENCE_KEY, memoHasContent ? "1" : "0");
+    publishAppearance(localStorage, state.settings);
     if (backup.memo && TAURI?.event?.emitTo) {
       try {
         await TAURI.event.emitTo("memo", "memo-data-imported", {});
@@ -2782,8 +2788,9 @@ const windowEventUnlisteners = [];
 let maintenanceTimer = null;
 
 function onMemoStorageChanged(event) {
-  if (event.key !== MEMO_STORAGE_KEY && event.key !== MEMO_DOCUMENT_KEY) return;
-  syncMemoState();
+  if (event.key === MEMO_PRESENCE_KEY) {
+    syncMemoState({ hasContent: event.newValue === "1" });
+  }
 }
 
 function onMemoWindowMessage(event) {
@@ -2793,6 +2800,7 @@ function onMemoWindowMessage(event) {
 }
 
 async function initializeApp() {
+  publishAppearance(localStorage, state.settings);
   await restoreWindowState();
   updateCompact(false);
   overviewWidthTier = getOverviewWidthTier();

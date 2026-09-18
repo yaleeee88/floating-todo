@@ -2,6 +2,7 @@ import {
   MEMO_DOCUMENT_KEY, MEMO_FONT, readMemoDocument,
   normalizeMemoDocument, renderMemoDocument, serializeMemoEditor,
 } from "./memo-document.js";
+import { APPEARANCE_KEY, MEMO_PRESENCE_KEY, appearanceSettings, publishSignal } from "./window-sync.js";
 
 const TAURI = window.__TAURI__;
 const appWindow = TAURI?.window?.getCurrentWindow?.();
@@ -29,6 +30,9 @@ let rememberedGeometry = readWindowGeometry();
 let closing = false;
 let memoDocument = normalizeMemoDocument(null);
 let memoLoaded = false;
+let contentDirty = false;
+let memoDirty = false;
+let savedMemoJson = null;
 let savedSelection = null;
 let statusTimer = null;
 let composing = false;
@@ -77,11 +81,15 @@ async function reloadMemoFromStorage({ restoreGeometry = false } = {}) {
     textSaveTimer = null;
   }
   memoDocument = readMemoDocument(localStorage);
+  savedMemoJson = localStorage.getItem(MEMO_DOCUMENT_KEY);
+  contentDirty = false;
+  memoDirty = savedMemoJson === null; // Migrate legacy text once, without touching its source.
   renderMemoDocument(memoInput, memoDocument);
   savedSelection = null;
   memoLoaded = true;
   applyFontSize();
   updateEditorState();
+  publishMemoPresence();
   await applyPinState();
   rememberedGeometry = readWindowGeometry();
   if (restoreGeometry) await restoreWindowGeometry();
@@ -89,18 +97,10 @@ async function reloadMemoFromStorage({ restoreGeometry = false } = {}) {
 
 function readAppearanceSettings() {
   try {
-    const settings = JSON.parse(localStorage.getItem(SNAPSHOT_KEY))?.settings;
-    const appearance = ["light", "dark", "system"].includes(settings?.appearance)
-      ? settings.appearance
-      : "system";
-    const opacity = finiteNumber(settings?.opacity);
-    return {
-      appearance,
-      opacity: opacity === null ? 0.9 : clamp(opacity, 0.45, 1),
-      customBg: typeof settings?.customBg === "string" && settings.customBg.trim()
-        ? settings.customBg.trim()
-        : null,
-    };
+    const signal = localStorage.getItem(APPEARANCE_KEY);
+    const settings = signal !== null ? JSON.parse(signal)
+      : JSON.parse(localStorage.getItem(SNAPSHOT_KEY))?.settings;
+    return appearanceSettings(settings);
   } catch (_) {
     return { appearance: "system", opacity: 0.9, customBg: null };
   }
@@ -127,14 +127,29 @@ function persistMemo() {
   }
   lastTextSaveAt = performance.now();
   if (!memoLoaded) return false;
+  if (!memoDirty) return true;
   try {
-    memoDocument = serializeMemoEditor(memoInput, memoDocument);
-    localStorage.setItem(MEMO_DOCUMENT_KEY, JSON.stringify(memoDocument));
+    if (contentDirty) {
+      memoDocument = serializeMemoEditor(memoInput, memoDocument);
+      contentDirty = false;
+    }
+    const json = JSON.stringify(memoDocument);
+    if (json !== savedMemoJson) localStorage.setItem(MEMO_DOCUMENT_KEY, json);
+    savedMemoJson = json;
+    memoDirty = false;
+    publishMemoPresence();
     return true;
   } catch (error) {
     console.warn("Unable to persist memo", error);
     showStatus("保存失败，请暂时保留窗口并复制内容", false);
     return false;
+  }
+}
+
+function publishMemoPresence() {
+  const hasContent = memoDocument.text.trim().length > 0;
+  if (!publishSignal(localStorage, MEMO_PRESENCE_KEY, hasContent ? "1" : "0")) {
+    void notifyMain(!closing);
   }
 }
 
@@ -149,9 +164,11 @@ function applyFontSize() {
 }
 
 function changeFontSize(delta) {
+  const previous = memoDocument.fontSize;
   memoDocument.fontSize = delta === 0 ? MEMO_FONT.default
     : clamp(memoDocument.fontSize + delta, MEMO_FONT.min, MEMO_FONT.max);
   applyFontSize();
+  if (memoDocument.fontSize !== previous) memoDirty = true;
   if (persistMemo()) showStatus(`字号 ${memoDocument.fontSize}`);
 }
 
@@ -181,6 +198,7 @@ async function togglePin() {
   const previous = memoDocument.pinned;
   memoDocument.pinned = !previous;
   if (await applyPinState()) {
+    memoDirty = true;
     persistMemo();
     if (!appWindow) showStatus("已记住选择，桌面版支持窗口置顶");
   } else {
@@ -214,6 +232,9 @@ function toggleBold() {
     selection.addRange(savedSelection);
   }
   // Native editing commands retain selection and the browser's undo history.
+  // A collapsed selection only changes the typing style, not the saved document.
+  const range = editorSelection();
+  if (range && !range.collapsed) contentDirty = memoDirty = true;
   document.execCommand("bold", false);
   updateEditorState();
   scheduleMemoSave();
@@ -253,7 +274,8 @@ function persistWindowGeometry() {
   rememberWindowGeometry(browserPosition);
   if (!rememberedGeometry) return;
   try {
-    localStorage.setItem(WINDOW_STATE_KEY, JSON.stringify(rememberedGeometry));
+    const json = JSON.stringify(rememberedGeometry);
+    if (localStorage.getItem(WINDOW_STATE_KEY) !== json) localStorage.setItem(WINDOW_STATE_KEY, json);
   } catch (error) {
     console.warn("Unable to persist memo window geometry", error);
   }
@@ -401,12 +423,14 @@ async function closeMemo() {
 
 function bindInteractions() {
   memoInput.addEventListener("input", () => {
+    contentDirty = memoDirty = true;
     updateEditorState();
     if (!composing) scheduleMemoSave();
   });
   memoInput.addEventListener("compositionstart", () => { composing = true; });
   memoInput.addEventListener("compositionend", () => {
     composing = false;
+    contentDirty = memoDirty = true;
     updateEditorState();
     scheduleMemoSave();
   });
@@ -447,12 +471,13 @@ function bindInteractions() {
   window.addEventListener("resize", () => scheduleWindowGeometrySave());
   window.addEventListener("blur", persistMemo);
   window.addEventListener("storage", (event) => {
-    if (event.key === SNAPSHOT_KEY) {
+    if (event.key === APPEARANCE_KEY || (event.key === SNAPSHOT_KEY && localStorage.getItem(APPEARANCE_KEY) === null)) {
       applyAppearance();
     } else if (event.key === MEMO_DOCUMENT_KEY) {
       void reloadMemoFromStorage();
     } else if (event.key === WINDOW_STATE_KEY) {
-      void reloadMemoFromStorage({ restoreGeometry: true });
+      rememberedGeometry = readWindowGeometry();
+      void restoreWindowGeometry();
     }
   });
   window.addEventListener("keydown", (event) => {
